@@ -163,6 +163,8 @@ numerical edge cases.
 ## Commit History
 
 ```
+e663c44 emilio: precomputed ln(weights) + optimized matmul — 0.49 → 4.3 tok/s (8.8×)
+02b0dca autoeml exp 15-17: rayon j-parallelism + zero-copy — 456 μs (37.8× faster)
 34dd3e7 autoeml exp 11: branchless sign — ~3,917 μs (77.7% faster than baseline)
 31072d7 autoeml exp 10: batched atomic counter — ~3,995 μs (77.3% faster than baseline)
 cc618f6 autoeml exp 9: 4-wide loop unroll — 4,065 μs (76.9% faster than baseline)
@@ -172,6 +174,68 @@ a494232 autoeml exp 4: activation sharing — precompute ln(X) for Q/K/V reuse
 a48ff74 autoeml exp 2: transpose ln(B) for cache-friendly k-loop
 97e9a58 autoeml: autonomous EML graph optimization agent
 ```
+
+## Emilio Integration: Kernel → Inference Engine
+
+The autoeml micro-benchmark optimizes a single `(1, 896) × (896, 896)` matmul
+in isolation. Emilio is the full Qwen2.5-0.5B inference engine that executes
+24 transformer layers per token, each containing 7 matmuls plus RMSNorm, SiLU,
+RoPE, and softmax — all through pure EML arithmetic.
+
+### The Gap
+
+Emilio originally used `build_matmul_cse()` from `eml_optimizer.rs`, which:
+- Used full `Complex64::exp()` in the inner loop (cos + sin computation)
+- Recomputed `ln(B)` for every matmul call (weights never change)
+- Transposed `ln(B)` on every call (redundant work)
+- Used `Complex64::ln()` element-wise (2× slower than f64 path)
+
+This gave **0.49 tok/s** — each token required ~168 matmuls (7 per layer × 24
+layers) plus the LM head (the largest matmul: 896 × 151,936).
+
+### What Changed
+
+**Step 1: Optimized `build_matmul_cse`** — Rewrote the function body to use
+all autoeml kernel optimizations without atomic counters (which cause massive
+contention under rayon):
+- Real-exp bypass: `f64::exp(re)` + branchless sign from `im/π` parity
+- 4-wide loop unroll with independent accumulators
+- Rayon `par_iter_mut` over the j dimension (column parallelism)
+- Parallel `ln(A)`, `ln(B)`, and transpose
+
+**Step 2: Precomputed `ln(weights)` at load time** — Added
+`build_matmul_cse_precomp()` that accepts pre-computed `ln(B)` in transposed
+layout, skipping both `ln()` and transpose per call. Key insight: GGUF stores
+weights as `(out_dim, in_dim)`, and emilio transposes them to `(in_dim, out_dim)`
+before matmul, which internally transposes `ln(B)` to `(out_dim, in_dim)`.
+The double-transpose cancels — so element-wise `ln()` of the original GGUF
+layout gives the correct `ln_b_t` directly.
+
+**Step 3: Wired all 13 matmul call sites** — Every matmul in emilio
+(QKV projections, output projection, gate/up/down FFN, and LM head) now uses
+`build_matmul_cse_precomp` with layer-specific precomputed `ln(W)` fields.
+
+### Results
+
+| Metric | Before | After | Speedup |
+|--------|--------|-------|---------|
+| **Token generation** | 0.49 tok/s | **~4.3 tok/s** | **8.8×** |
+| **Per-token time** | ~2.05 s | ~0.23 s | 8.8× |
+| **Model load time** | 1.24 s | 2.69 s | +1.45 s (one-time) |
+| **Output quality** | ✓ correct | ✓ identical | — |
+
+The load-time increase (~1.45s) pays for precomputing `ln()` over ~494M weight
+elements (168 weight matrices × avg ~2.9M elements each). This is amortized
+over all generated tokens — break-even at ~1 token.
+
+### Where the Time Goes (per token, ~230 ms)
+
+At ~4.3 tok/s, each token takes ~230 ms across 24 layers:
+- **FFN matmuls** (gate + up + down): ~63% — 3 matmuls per layer, the gate/up
+  projections are (1, 896) × (896, 4864) = ~4.4M exp each
+- **LM head**: ~28% — (1, 896) × (896, 151936) = ~136M exp, runs once per token
+- **QKV + output projections**: ~9% — 4 matmuls per layer but smaller
+- **RMSNorm, SiLU, RoPE, softmax**: <1% — dominated by matmul cost
 
 ## Running AutoEML
 
@@ -188,4 +252,8 @@ cargo run --bin autoeml --release -- bench --transposed
 
 # Verify all operations
 cargo run --bin autoeml --release -- verify
+
+# Run emilio inference (Qwen2.5-0.5B)
+cargo run --bin emilio --release -- ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  --generate "The capital of France is"
 ```
