@@ -16,6 +16,8 @@ pub mod emilio;
 pub mod gguf;
 pub mod model;
 pub mod tokenizer;
+pub mod autoeml_kernel;
+pub mod autoeml_reference;
 #[cfg(feature = "python")]
 mod python;
 
