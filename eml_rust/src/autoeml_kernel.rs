@@ -169,16 +169,41 @@ pub fn kernel_fn_with_ln_a(
     //          sequential in the k-loop → cache-friendly.
     //          Optimization: since all values are ln(real), imaginary parts
     //          are 0 or π.  Use c_exp_real_signed to avoid complex trig.
+    //          4-wide unroll with independent accumulators for ILP.
     let mut result = vec![0.0f64; rows * cols];
     for i in 0..rows {
+        let a_off = i * inner;
         for j in 0..cols {
-            let mut acc = 0.0f64;
-            for k in 0..inner {
-                let la = ln_a[i * inner + k];
-                let lb = ln_b_t[j * inner + k];
-                acc += c_exp_real_signed(la.re + lb.re, la.im + lb.im);
+            let b_off = j * inner;
+            let mut acc0 = 0.0f64;
+            let mut acc1 = 0.0f64;
+            let mut acc2 = 0.0f64;
+            let mut acc3 = 0.0f64;
+            let chunks = inner / 4;
+            let remainder = inner % 4;
+            for c in 0..chunks {
+                let k = c * 4;
+                let la0 = ln_a[a_off + k];
+                let la1 = ln_a[a_off + k + 1];
+                let la2 = ln_a[a_off + k + 2];
+                let la3 = ln_a[a_off + k + 3];
+                let lb0 = ln_b_t[b_off + k];
+                let lb1 = ln_b_t[b_off + k + 1];
+                let lb2 = ln_b_t[b_off + k + 2];
+                let lb3 = ln_b_t[b_off + k + 3];
+                acc0 += c_exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
+                acc1 += c_exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
+                acc2 += c_exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
+                acc3 += c_exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
             }
-            result[i * cols + j] = acc;
+            // Remainder
+            for k in (chunks * 4)..(chunks * 4 + remainder) {
+                acc0 += c_exp_real_signed(
+                    ln_a[a_off + k].re + ln_b_t[b_off + k].re,
+                    ln_a[a_off + k].im + ln_b_t[b_off + k].im,
+                );
+            }
+            result[i * cols + j] = acc0 + acc1 + acc2 + acc3;
         }
     }
 
