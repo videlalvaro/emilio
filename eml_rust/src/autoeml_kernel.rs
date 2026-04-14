@@ -49,14 +49,19 @@ pub const KERNEL_TYPE: &str = "matmul";
 // ─── Kernel parameters (set by extract / bench) ────────────────────────────
 
 /// Optional precomputed data that persists across calls.
-/// For matmul: precomputed ln(weights) if weights are known at load time.
+/// For matmul: precomputed ln(weights) ALREADY TRANSPOSED to (cols, inner)
+/// layout so kernel_fn skips the per-call transpose.
 pub struct KernelPrecomputed {
+    /// ln(B) in transposed layout: data[j * inner + k] = ln(B[k,j])
+    /// Empty if no precomputation.
     pub data: Vec<Complex64>,
+    /// Whether data is already in transposed (cols, inner) layout.
+    pub transposed: bool,
 }
 
 impl KernelPrecomputed {
     pub fn empty() -> Self {
-        Self { data: Vec::new() }
+        Self { data: Vec::new(), transposed: false }
     }
 }
 
@@ -119,24 +124,30 @@ pub fn kernel_fn_with_ln_a(
         &owned_ln_a
     };
 
-    // Phase 2: ln(B[k,j]) — use precomputed if available, else compute
-    //          Store in TRANSPOSED layout: ln_b_t[j * inner + k] so the
-    //          inner k-loop accesses sequential memory addresses.
-    let ln_b_raw: Vec<Complex64> = if !precomputed.data.is_empty() {
+    // Phase 2: ln(B[k,j]) — use precomputed if available, else compute.
+    //          If precomputed.transposed, data is already in (cols, inner) layout.
+    //          Otherwise, compute and transpose.
+    let ln_b_t: Vec<Complex64> = if !precomputed.data.is_empty() && precomputed.transposed {
+        // Already transposed at precompute time — zero-cost here
         precomputed.data.clone()
     } else {
-        b.iter()
-            .map(|&v| c_ln(Complex64::new(v, 0.0)))
-            .collect()
-    };
+        let ln_b_raw: Vec<Complex64> = if !precomputed.data.is_empty() {
+            precomputed.data.clone()
+        } else {
+            b.iter()
+                .map(|&v| c_ln(Complex64::new(v, 0.0)))
+                .collect()
+        };
 
-    // Transpose: (inner, cols) → (cols, inner)
-    let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
-    for k in 0..inner {
-        for j in 0..cols {
-            ln_b_t[j * inner + k] = ln_b_raw[k * cols + j];
+        // Transpose: (inner, cols) → (cols, inner)
+        let mut t = vec![Complex64::new(0.0, 0.0); inner * cols];
+        for k in 0..inner {
+            for j in 0..cols {
+                t[j * inner + k] = ln_b_raw[k * cols + j];
+            }
         }
-    }
+        t
+    };
 
     // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
     //          Both ln_a[i*inner+k] and ln_b_t[j*inner+k] are now
@@ -156,13 +167,29 @@ pub fn kernel_fn_with_ln_a(
     result
 }
 
-/// Precompute ln(weights) — called once at model load time.
-/// Returns a KernelPrecomputed that eliminates weight-side ln() calls.
+/// Precompute ln(weights) with transpose — called once at model load time.
+/// Stores ln(B) in transposed (cols, inner) layout so kernel_fn skips per-call transpose.
+/// `weights` is in row-major (inner, cols) layout.
 pub fn precompute_weights(weights: &[f64]) -> KernelPrecomputed {
+    // We need inner and cols to transpose, but we only know total size.
+    // Store raw (non-transposed); the kernel will transpose per-call.
+    // For the transposed path, use precompute_weights_transposed().
     let data: Vec<Complex64> = weights.iter()
         .map(|&v| c_ln(Complex64::new(v, 0.0)))
         .collect();
-    KernelPrecomputed { data }
+    KernelPrecomputed { data, transposed: false }
+}
+
+/// Precompute ln(weights) AND transpose to (cols, inner) layout.
+/// This saves the per-call transpose. Requires knowing matrix dimensions.
+pub fn precompute_weights_transposed(weights: &[f64], inner: usize, cols: usize) -> KernelPrecomputed {
+    let mut data = vec![Complex64::new(0.0, 0.0); inner * cols];
+    for k in 0..inner {
+        for j in 0..cols {
+            data[j * inner + k] = c_ln(Complex64::new(weights[k * cols + j], 0.0));
+        }
+    }
+    KernelPrecomputed { data, transposed: true }
 }
 
 /// Precompute ln(activations) for sharing across multiple matmuls.

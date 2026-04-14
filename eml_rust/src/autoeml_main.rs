@@ -239,6 +239,7 @@ fn cmd_bench(args: &[String]) {
     let size = parse_arg(args, "--size").unwrap_or(896);
     let iters = parse_arg(args, "--iters").unwrap_or(5);
     let precomp = args.iter().any(|a| a == "--precomputed");
+    let transposed = args.iter().any(|a| a == "--transposed");
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  AutoEML Benchmark — {}                             ║", autoeml_kernel::KERNEL_TYPE);
@@ -247,7 +248,7 @@ fn cmd_bench(args: &[String]) {
 
     let kernel_type = autoeml_kernel::KERNEL_TYPE;
     match kernel_type {
-        "matmul" => bench_matmul(size, iters, precomp),
+        "matmul" => bench_matmul(size, iters, precomp, transposed),
         other => {
             eprintln!("Unknown kernel type: {other}");
             std::process::exit(1);
@@ -255,17 +256,24 @@ fn cmd_bench(args: &[String]) {
     }
 }
 
-fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
+fn bench_matmul(size: usize, iters: usize, use_precomp: bool, use_transposed: bool) {
     let mut all_pass = true;
+
+    // Helper: build precomputed struct matching flags
+    let make_pc = |b: &[f64], inner: usize, cols: usize| -> autoeml_kernel::KernelPrecomputed {
+        if use_transposed {
+            autoeml_kernel::precompute_weights_transposed(b, inner, cols)
+        } else if use_precomp {
+            autoeml_kernel::precompute_weights(b)
+        } else {
+            autoeml_kernel::KernelPrecomputed::empty()
+        }
+    };
 
     // ── Stage 1: Smoke test (4×4) ───────────────────────────────────────
     print!("Stage 1: Smoke test (4×4)... ");
     let (a, b) = gen_matmul_data(4, 4, 4, 42);
-    let pc = if use_precomp {
-        autoeml_kernel::precompute_weights(&b)
-    } else {
-        autoeml_kernel::KernelPrecomputed::empty()
-    };
+    let pc = make_pc(&b, 4, 4);
     autoeml_kernel::reset_counts();
     let result = autoeml_kernel::kernel_fn(&a, &b, 4, 4, 4, &pc);
     let reference = autoeml_reference::reference_matmul(&a, &b, 4, 4, 4);
@@ -283,11 +291,7 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     let mut sweep_pass = true;
     for &(m, k, n) in &shapes {
         let (a, b) = gen_matmul_data(m, k, n, 123);
-        let pc = if use_precomp {
-            autoeml_kernel::precompute_weights(&b)
-        } else {
-            autoeml_kernel::KernelPrecomputed::empty()
-        };
+        let pc = make_pc(&b, k, n);
         autoeml_kernel::reset_counts();
         let result = autoeml_kernel::kernel_fn(&a, &b, m, k, n, &pc);
         let reference = autoeml_reference::reference_matmul(&a, &b, m, k, n);
@@ -311,11 +315,7 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     let mut stab_pass = true;
     for (name, (a, b)) in &cases {
         let n = (a.len() as f64).sqrt() as usize;
-        let pc = if use_precomp {
-            autoeml_kernel::precompute_weights(b)
-        } else {
-            autoeml_kernel::KernelPrecomputed::empty()
-        };
+        let pc = make_pc(b, n, n);
         autoeml_kernel::reset_counts();
         let result = autoeml_kernel::kernel_fn(a, b, n, n, n, &pc);
         let reference = autoeml_reference::reference_matmul(a, b, n, n, n);
@@ -331,11 +331,7 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     // ── Stage 4: Determinism ────────────────────────────────────────────
     print!("Stage 4: Determinism... ");
     let (a, b) = gen_matmul_data(16, 16, 16, 99);
-    let pc = if use_precomp {
-        autoeml_kernel::precompute_weights(&b)
-    } else {
-        autoeml_kernel::KernelPrecomputed::empty()
-    };
+    let pc = make_pc(&b, 16, 16);
     autoeml_kernel::reset_counts();
     let r1 = autoeml_kernel::kernel_fn(&a, &b, 16, 16, 16, &pc);
     autoeml_kernel::reset_counts();
@@ -347,14 +343,10 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     print!("Stage 5: EML purity... ");
     let (m, k, n) = (4, 8, 4);
     let (a, b) = gen_matmul_data(m, k, n, 55);
-    let pc_purity = if use_precomp {
-        // Precompute outside counting window
-        let p = autoeml_kernel::precompute_weights(&b);
+    let pc_purity = {
+        let p = make_pc(&b, k, n);
         autoeml_kernel::reset_counts();
         p
-    } else {
-        autoeml_kernel::reset_counts();
-        autoeml_kernel::KernelPrecomputed::empty()
     };
     let _ = autoeml_kernel::kernel_fn(&a, &b, m, k, n, &pc_purity);
     let (exp_count, ln_count) = autoeml_kernel::get_counts();
@@ -377,11 +369,7 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     println!("Performance (size={size}, iters={iters}):");
     let (m, k, n) = (1, size, size);
     let (a, b) = gen_matmul_data(m, k, n, 77);
-    let pc = if use_precomp {
-        autoeml_kernel::precompute_weights(&b)
-    } else {
-        autoeml_kernel::KernelPrecomputed::empty()
-    };
+    let pc = make_pc(&b, k, n);
 
     // Warm up
     autoeml_kernel::reset_counts();
@@ -410,8 +398,9 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool) {
     println!("    ln calls:           {warm_ln}");
     println!("  median latency:       {} μs", median_us);
     println!("  throughput:           {:.0} elements/sec", throughput);
-    if use_precomp {
-        println!("  precomputed:          YES (ln(weights) excluded from count)");
+    if use_precomp || use_transposed {
+        println!("  precomputed:          YES{}",
+                 if use_transposed { " (transposed at load time)" } else { "" });
     }
 
     // ── Summary ─────────────────────────────────────────────────────────
