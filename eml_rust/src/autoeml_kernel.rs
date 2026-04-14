@@ -97,8 +97,9 @@ pub fn kernel_fn(
         .collect();
 
     // Phase 2: ln(B[k,j]) — use precomputed if available, else compute
-    let ln_b: Vec<Complex64> = if !precomputed.data.is_empty() {
-        // Precomputed: 0 transcendentals for weight-side ln
+    //          Store in TRANSPOSED layout: ln_b_t[j * inner + k] so the
+    //          inner k-loop accesses sequential memory addresses.
+    let ln_b_raw: Vec<Complex64> = if !precomputed.data.is_empty() {
         precomputed.data.clone()
     } else {
         b.iter()
@@ -106,14 +107,23 @@ pub fn kernel_fn(
             .collect()
     };
 
-    // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B[k,j])
-    //          Addition is 0-cost, exp is 1 transcendental per product.
+    // Transpose: (inner, cols) → (cols, inner)
+    let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
+    for k in 0..inner {
+        for j in 0..cols {
+            ln_b_t[j * inner + k] = ln_b_raw[k * cols + j];
+        }
+    }
+
+    // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
+    //          Both ln_a[i*inner+k] and ln_b_t[j*inner+k] are now
+    //          sequential in the k-loop → cache-friendly.
     let mut result = vec![0.0f64; rows * cols];
     for i in 0..rows {
         for j in 0..cols {
             let mut acc = Complex64::new(0.0, 0.0);
             for k in 0..inner {
-                let sum = ln_a[i * inner + k] + ln_b[k * cols + j];
+                let sum = ln_a[i * inner + k] + ln_b_t[j * inner + k];
                 acc += c_exp(sum);
             }
             result[i * cols + j] = acc.re;
