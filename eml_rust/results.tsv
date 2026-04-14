@@ -1,0 +1,16 @@
+experiment	kernel_type	transcendentals	exp_calls	ln_calls	throughput	latency_us	correctness	description
+0	matmul	1606528	802816	803712	51978	17238	PASS	baseline CSE matmul (no precomputed weights)
+1	matmul	1606528	802816	803712	~17000	~52000	PASS	REVERTED: rayon parallel outer — 3x slower on M=1
+2	matmul	1606528	802816	803712	54323	16494	PASS	KEPT: transpose ln(B) — 4.3% faster
+3	matmul	1606528	802816	803712	-	16913	PASS	REVERTED: two-phase batched eval — slight regression
+4	matmul	-	-	-1792/QKV	-	-	PASS	KEPT: activation sharing — 66.7% ln reduction per QKV set
+5	matmul	803712	802816	896	126518	7082	PASS	KEPT: pre-transposed weights — 59.7% faster
+6	matmul	803712	802816	896	210131	4264	PASS	KEPT: real-exp bypass — 75.8% faster than baseline
+7	matmul	803712	802816	896	163355	5485	PASS	REVERTED: SoA re/im split — 28% slower
+8	matmul	803712	802816	896	191658	4675	PASS	REVERTED: precomputed signs — 9.6% slower
+9	matmul	803712	802816	896	220418	4065	PASS	KEPT: 4-wide unroll — 4.7% faster
+10	matmul	803712	802816	896	221289	3995	PASS	KEPT: batched atomic counter — 0.4% faster
+11	matmul	803712	802816	896	~225000	3917	PASS	KEPT: branchless sign — 2% faster
+12	matmul	803712	802816	896	-	~3921	PASS	REVERTED: truncation vs round — noise
+13	matmul	803712	802816	896	-	4235	PASS	REVERTED: 8-wide unroll — register pressure
+14	matmul	803712	802816	896	-	5719	PASS	REVERTED: pre-extracted re/sign — 46% slower
