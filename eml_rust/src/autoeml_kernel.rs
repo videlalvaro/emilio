@@ -50,6 +50,15 @@ fn c_exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
     if n & 1 == 0 { e } else { -e }
 }
 
+/// Uncounted real exp with sign — used in hot loops where exp count is
+/// batch-added outside the loop. Same logic as c_exp_real_signed.
+#[inline(always)]
+fn exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
+    let e = sum_re.exp();
+    let n = (sum_im * std::f64::consts::FRAC_1_PI).round() as i64;
+    if n & 1 == 0 { e } else { -e }
+}
+
 /// Counted ln — the ONLY way to call ln() in this file.
 #[inline(always)]
 pub fn c_ln(x: Complex64) -> Complex64 {
@@ -168,8 +177,12 @@ pub fn kernel_fn_with_ln_a(
     //          Both ln_a[i*inner+k] and ln_b_t[j*inner+k] are now
     //          sequential in the k-loop → cache-friendly.
     //          Optimization: since all values are ln(real), imaginary parts
-    //          are 0 or π.  Use c_exp_real_signed to avoid complex trig.
+    //          are 0 or π.  Use real-valued exp with sign from im/π parity.
     //          4-wide unroll with independent accumulators for ILP.
+    //          Batch atomic counter: add total exp count once after loop.
+    let total_exp = (rows * inner * cols) as u64;
+    EXP_CALLS.fetch_add(total_exp, Ordering::Relaxed);
+
     let mut result = vec![0.0f64; rows * cols];
     for i in 0..rows {
         let a_off = i * inner;
@@ -191,14 +204,14 @@ pub fn kernel_fn_with_ln_a(
                 let lb1 = ln_b_t[b_off + k + 1];
                 let lb2 = ln_b_t[b_off + k + 2];
                 let lb3 = ln_b_t[b_off + k + 3];
-                acc0 += c_exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
-                acc1 += c_exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
-                acc2 += c_exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
-                acc3 += c_exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
+                acc0 += exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
+                acc1 += exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
+                acc2 += exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
+                acc3 += exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
             }
             // Remainder
             for k in (chunks * 4)..(chunks * 4 + remainder) {
-                acc0 += c_exp_real_signed(
+                acc0 += exp_real_signed(
                     ln_a[a_off + k].re + ln_b_t[b_off + k].re,
                     ln_a[a_off + k].im + ln_b_t[b_off + k].im,
                 );
