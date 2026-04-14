@@ -51,12 +51,13 @@ fn c_exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
 }
 
 /// Uncounted real exp with sign — used in hot loops where exp count is
-/// batch-added outside the loop. Same logic as c_exp_real_signed.
+/// batch-added outside the loop. Branchless sign from im/π parity.
 #[inline(always)]
 fn exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
     let e = sum_re.exp();
     let n = (sum_im * std::f64::consts::FRAC_1_PI).round() as i64;
-    if n & 1 == 0 { e } else { -e }
+    // Branchless: sign = 1.0 - 2.0*(n&1) → +1.0 if even, -1.0 if odd
+    e * (1.0 - 2.0 * (n & 1) as f64)
 }
 
 /// Counted ln — the ONLY way to call ln() in this file.
