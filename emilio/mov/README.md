@@ -61,10 +61,16 @@ No complex numbers in the hot path.
 
 ## Building
 
-### Option 1: Docker (recommended)
+### Option 1: Docker (recommended — works on any platform)
 
 ```bash
+# x86 host (Linux or Intel Mac)
 docker build -t emilio-mov -f mov/Dockerfile mov/
+
+# Apple Silicon / ARM host (uses QEMU emulation)
+docker build --platform linux/386 -t emilio-mov -f mov/Dockerfile mov/
+
+# Extract the binary
 docker run --rm -v $(pwd)/mov/build:/out emilio-mov
 # Binary: ./mov/build/emilio_mov
 ```
@@ -89,28 +95,40 @@ Requirements:
 ./build_mov.sh --fast
 ```
 
-### Sanity check with GCC
+### Compile test on any platform (macOS, Linux, WSL)
 
-Before attempting the movfuscator build, verify the C89 code compiles:
+The C89 source compiles and runs natively on any platform with a C compiler
+(GCC, Clang, MSVC). This exercises the full inference logic — the only
+difference is that the resulting binary uses normal instructions instead of MOV:
 
 ```bash
-gcc -std=c89 -pedantic -Wall -m32 eml_mov.c eml_tokenizer.c -o emilio_test -lm
+# macOS (Apple Silicon or Intel)
+clang -std=c89 -pedantic -Wall eml_mov.c eml_tokenizer.c -o emilio_test -lm
+
+# Linux (any arch)
+gcc -std=c89 -pedantic -Wall eml_mov.c eml_tokenizer.c -o emilio_test -lm
 ```
 
 ## Testing
 
-Run the combined test script (no movfuscator needed):
+Run the combined test script (works on macOS, Linux, WSL):
 
 ```bash
 ./test_mov.sh
 ```
 
 This runs:
-1. **GCC C89 strict compile** -- both main and test binaries, zero warnings required
+1. **C89 strict compile** (GCC or Clang) -- both main and test binaries, zero warnings required
 2. **Self-test** -- 61 checks covering software math, EML ops, matmul, softmax, RMSNorm, SiLU, RoPE
 3. **Smoke test** -- main binary prints usage message with correct branding
 
-For the full pipeline including movfuscator build + MOV-only verification:
+For the full MOV pipeline via Docker (any platform):
+
+```bash
+./test_mov.sh --docker
+```
+
+For the full MOV pipeline natively (needs 32-bit Linux):
 
 ```bash
 ./test_mov.sh --full

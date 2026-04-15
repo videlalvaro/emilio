@@ -13,15 +13,25 @@
 #ifndef EML_MOV_H
 #define EML_MOV_H
 
-/* ==== Minimal libc prototypes (no system headers) ========================
- * LCC (movfuscator frontend) cannot parse modern system headers that use
- * C99 features. We declare only the functions we need.
+/* ==== Libc interface =====================================================
+ *
+ * When compiling with a standard compiler (GCC, Clang) we include the
+ * real system headers so that prototypes match the platform ABI (32-bit
+ * Linux, 64-bit Linux, 64-bit macOS / Apple Silicon, etc.).
+ *
+ * When compiling with the M/o/Vfuscator (LCC frontend), the system
+ * headers use C99 features that LCC cannot parse, so we declare only
+ * the functions we need with minimal C89-safe prototypes.
+ *
+ * The EML_MOVCC macro is defined automatically by build_mov.sh when
+ * invoking movcc.
  */
 
+#ifdef EML_MOVCC
+/* ---- Movfuscator: manual C89 libc prototypes ---- */
 typedef unsigned long eml_size_t;
 #define EML_NULL ((void *)0)
 
-/* stdio */
 typedef struct __eml_file_t EML_FILE;
 extern EML_FILE *fopen(const char *path, const char *mode);
 extern int fclose(EML_FILE *f);
@@ -31,17 +41,14 @@ extern int printf(const char *fmt, ...);
 extern int fputc(int c, EML_FILE *f);
 extern int fflush(EML_FILE *f);
 
-/* stderr handle -- set from linker symbol */
 extern EML_FILE *stderr;
 
-/* stdlib */
 extern void *malloc(eml_size_t size);
 extern void *calloc(eml_size_t n, eml_size_t size);
 extern void *realloc(void *ptr, eml_size_t size);
 extern void free(void *ptr);
 extern void exit(int status);
 
-/* string */
 extern eml_size_t strlen(const char *s);
 extern int strcmp(const char *a, const char *b);
 extern int strncmp(const char *a, const char *b, eml_size_t n);
@@ -49,6 +56,17 @@ extern char *strcpy(char *dst, const char *src);
 extern char *strcat(char *dst, const char *src);
 extern void *memcpy(void *dst, const void *src, eml_size_t n);
 extern void *memset(void *s, int c, eml_size_t n);
+
+#else
+/* ---- Standard compiler: use real system headers ---- */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef size_t eml_size_t;
+#define EML_NULL NULL
+typedef FILE EML_FILE;
+#endif /* EML_MOVCC */
 
 /* ==== Constants ========================================================= */
 

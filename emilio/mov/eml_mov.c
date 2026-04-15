@@ -367,38 +367,50 @@ void build_matmul_sm(
         }
     }
 
-    /* Phase 2: matmul with 4-wide unroll */
+    /* Phase 2: Fused APL-style inner product (Iverson, +.×)
+     *
+     * Instead of K independent exp() calls per dot product, factor out the max
+     * log-magnitude and prune negligible terms:
+     *
+     *   m = max_k(la_mag[k] + w_mag[k])
+     *   acc = exp(m) * Σ_k exp(la_mag[k] + w_mag[k] - m) * sign[k]
+     *
+     * Benefits:
+     *   1. All exp() arguments are ≤ 0, improving numerical stability
+     *   2. Terms where (log_term - m) < PRUNE_THRESHOLD are skipped (exp ≈ 0)
+     *   3. Each pruned term saves one sw_exp() call = hundreds of MOV instructions
+     */
+#define MATMUL_PRUNE_THRESH -30.0  /* exp(-30) ≈ 9.4e-14, negligible */
     for (i = 0; i < rows; i++) {
         int a_off = i * inner;
         for (j = 0; j < cols; j++) {
             int b_off = j * inner;
-            double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
-            int chunks = inner / 4;
-            int remainder = inner % 4;
-            int c;
-            double e;
+            double max_lt, acc;
 
-            for (c = 0; c < chunks; c++) {
-                k = c * 4;
-                e = sw_exp(la_mags[a_off+k] + w->magnitudes[b_off+k]);
-                acc0 += e * la_signs[a_off+k] * w->signs[b_off+k];
-
-                e = sw_exp(la_mags[a_off+k+1] + w->magnitudes[b_off+k+1]);
-                acc1 += e * la_signs[a_off+k+1] * w->signs[b_off+k+1];
-
-                e = sw_exp(la_mags[a_off+k+2] + w->magnitudes[b_off+k+2]);
-                acc2 += e * la_signs[a_off+k+2] * w->signs[b_off+k+2];
-
-                e = sw_exp(la_mags[a_off+k+3] + w->magnitudes[b_off+k+3]);
-                acc3 += e * la_signs[a_off+k+3] * w->signs[b_off+k+3];
+            /* Pass 1: find max log-term (0 transcendentals) */
+            max_lt = EML_NEG_INF;
+            for (k = 0; k < inner; k++) {
+                double lt = la_mags[a_off+k] + w->magnitudes[b_off+k];
+                if (lt > max_lt) max_lt = lt;
             }
-            for (k = chunks * 4; k < chunks * 4 + remainder; k++) {
-                e = sw_exp(la_mags[a_off+k] + w->magnitudes[b_off+k]);
-                acc0 += e * la_signs[a_off+k] * w->signs[b_off+k];
+
+            /* Pass 2: accumulate with pruning */
+            acc = 0.0;
+            if (max_lt > EML_NEG_INF) {
+                for (k = 0; k < inner; k++) {
+                    double lt = la_mags[a_off+k] + w->magnitudes[b_off+k];
+                    double shifted = lt - max_lt;
+                    if (shifted > MATMUL_PRUNE_THRESH) {
+                        double e = sw_exp(shifted);
+                        acc += e * la_signs[a_off+k] * w->signs[b_off+k];
+                    }
+                }
+                acc *= sw_exp(max_lt);
             }
-            result[i * cols + j] = acc0 + acc1 + acc2 + acc3;
+            result[i * cols + j] = acc;
         }
     }
+#undef MATMUL_PRUNE_THRESH
 
     free(la_mags);
     free(la_signs);
@@ -412,61 +424,48 @@ void build_matmul_sm(
 /*
  * RMSNorm(x) = x / sqrt(mean(x^2) + eps) * gamma
  *
- * In EML: x^2 = exp(2*ln(x)), mean via sum/N, sqrt = exp(0.5*ln(...))
- * All ln(x) cached and reused in final: exp(ln(x) + ln(gamma) - ln(std))
+ * Peephole optimization (Dragon Book §8.7):
+ *   Before: x^2 via exp(2*ln|x|), normalize via exp(ln_x + ln_g - ln_std)
+ *           → 2N logs + 2N exps + 2 (sqrt)
+ *   After:  x^2 via x*x, normalize via x*gamma/rms
+ *           → 0 logs + 0 exps (only sw_sqrt for rms)
+ *   Saving: ~4N transcendentals per call
  */
 void eml_rms_norm(double *out, const double *x, const double *gamma,
                   int n, double eps)
 {
     int i;
-    double sq_sum, mean_sq, std_val, ln_std;
-    double *ln_x;
-    double nc;
+    double sq_sum, inv_rms;
 
-    ln_x = (double *)malloc((eml_size_t)n * sizeof(double));
-    nc = (double)n;
-
-    /* cache ln(x_i) -- handles sign via abs+sign tracking */
-    for (i = 0; i < n; i++) {
-        if (x[i] > 0.0)      ln_x[i] = sw_log(x[i]);
-        else if (x[i] < 0.0) ln_x[i] = sw_log(-x[i]);
-        else                  ln_x[i] = EML_NEG_INF;
-    }
-
-    /* sum of x^2 = sum of exp(2*ln|x|) */
+    /* sum of x^2 -- direct multiply, 0 transcendentals */
     sq_sum = 0.0;
     for (i = 0; i < n; i++) {
-        sq_sum += sw_exp(2.0 * ln_x[i]);
+        sq_sum += x[i] * x[i];
     }
 
-    /* mean(x^2) */
-    mean_sq = sq_sum / nc;
+    /* rms = sqrt(mean(x^2) + eps), using Newton's method (sw_sqrt) */
+    inv_rms = 1.0 / sw_sqrt(sq_sum / (double)n + eps);
 
-    /* std = sqrt(mean_sq + eps) */
-    std_val = sw_sqrt(mean_sq + eps);
-    ln_std = sw_log(std_val);
-
-    /* result_i = x_i * gamma_i / std = sign(x_i) * exp(ln|x_i| + ln|gamma_i| - ln_std) */
+    /* result_i = x_i * gamma_i / rms -- direct multiply+divide, 0 transcendentals */
     for (i = 0; i < n; i++) {
-        double sign_x = (x[i] >= 0.0) ? 1.0 : -1.0;
-        double sign_g = (gamma[i] >= 0.0) ? 1.0 : -1.0;
-        double ln_g = sw_log(sw_fabs(gamma[i]));
-        if (x[i] == 0.0) { out[i] = 0.0; continue; }
-        out[i] = sign_x * sign_g * sw_exp(ln_x[i] + ln_g - ln_std);
+        out[i] = x[i] * gamma[i] * inv_rms;
     }
-
-    free(ln_x);
 }
 
 /*
  * SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ *
+ * Peephole optimization (Dragon Book §8.7):
+ *   Before: sig via eml ops, out = eml_mul_f(x, sig) → 1 exp + 2 logs + 1 exp
+ *   After:  sig = 1/(1+exp(-x)), out = x * sig       → 1 exp only
+ *   Saving: 2 logs + 1 exp per element
  */
 void eml_silu_vec(double *out, const double *x, int n)
 {
     int i;
     for (i = 0; i < n; i++) {
-        double sig = eml_inv_f(eml_add_f(1.0, sw_exp(eml_neg_f(x[i]))));
-        out[i] = eml_mul_f(x[i], sig);
+        double sig = 1.0 / (1.0 + sw_exp(-x[i]));
+        out[i] = x[i] * sig;
     }
 }
 
@@ -553,10 +552,11 @@ void rope_apply(const RopeCache *r, double *x, int pos)
         double sin_v = r->sin_cache[pos * d_half + i];
         double x0 = x[i];
         double x1 = x[i + d_half];
-        /* x'[i]        = x[i]*cos - x[i+d_half]*sin */
-        /* x'[i+d_half] = x[i]*sin + x[i+d_half]*cos */
-        x[i]          = eml_sub_f(eml_mul_f(x0, cos_v), eml_mul_f(x1, sin_v));
-        x[i + d_half] = eml_add_f(eml_mul_f(x0, sin_v), eml_mul_f(x1, cos_v));
+        /* x'[i]        = x[i]*cos - x[i+d_half]*sin
+         * x'[i+d_half] = x[i]*sin + x[i+d_half]*cos
+         * Peephole: all four operands are real-domain scalars. */
+        x[i]          = x0 * cos_v - x1 * sin_v;
+        x[i + d_half] = x0 * sin_v + x1 * cos_v;
     }
 }
 
@@ -672,7 +672,8 @@ static void v2_gqa_attention_one(
     free(v_new);
 
     /* Attention: single query against all cached K,V */
-    scale = eml_inv_f(eml_sqrt_f((double)d_head));
+    /* Peephole: scale is a real scalar, use sw_sqrt (Newton) not eml_sqrt_f (log-domain) */
+    scale = 1.0 / sw_sqrt((double)d_head);
     memset(attn_out, 0, (eml_size_t)d * sizeof(double));
 
     scores = (double *)malloc((eml_size_t)t * sizeof(double));
@@ -681,26 +682,32 @@ static void v2_gqa_attention_one(
     for (h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;
 
-        /* Compute attention scores */
+        /* Compute attention scores
+         * Peephole: q, k, scale are all real-domain values.
+         * Direct multiply saves 2 logs + 1 exp per element vs eml_mul_f.
+         */
         for (j = 0; j < t; j++) {
             double dot = 0.0;
             for (dd = 0; dd < d_head; dd++) {
                 double qv = q[h * d_head + dd];
                 double kval = kv->k[j * kv_dim + kv_h * d_head + dd];
-                dot += eml_mul_f(qv, kval);
+                dot += qv * kval;
             }
-            scores[j] = eml_mul_f(dot, scale);
+            scores[j] = dot * scale;
         }
 
         /* Softmax */
         build_softmax_cse(attn_w, scores, t);
 
-        /* Weighted sum over cached V */
+        /* Weighted sum over cached V
+         * Peephole: attn_w (softmax output) and V are real-domain.
+         * Direct multiply saves 2 logs + 1 exp per element.
+         */
         for (dd = 0; dd < d_head; dd++) {
             double acc = 0.0;
             for (j = 0; j < t; j++) {
                 double vv = kv->v[j * kv_dim + kv_h * d_head + dd];
-                acc += eml_mul_f(attn_w[j], vv);
+                acc += attn_w[j] * vv;
             }
             attn_out[h * d_head + dd] = acc;
         }
@@ -745,8 +752,16 @@ static void v2_swiglu_ffn(
     /* SiLU(gate) */
     eml_silu_vec(gate_act, gate_up, d_ff);
 
-    /* gate_act * up */
-    eml_mul_vec(hidden, gate_act, gate_up + d_ff, d_ff);
+    /* gate_act * up
+     * Peephole: both operands are real-domain (SiLU output × up projection).
+     * Direct multiply saves 2 logs + 1 exp per element vs eml_mul_vec.
+     */
+    {
+        int i;
+        for (i = 0; i < d_ff; i++) {
+            hidden[i] = gate_act[i] * gate_up[d_ff + i];
+        }
+    }
 
     free(gate_up);
     free(gate_act);

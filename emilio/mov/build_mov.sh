@@ -237,6 +237,7 @@ log "  This will take a while -- every instruction becomes MOV."
 
 "$MOVCC" \
     $MOVFLOW_FLAG \
+    -DEML_MOVCC \
     "$SCRIPT_DIR/eml_mov.c" \
     "$SCRIPT_DIR/eml_tokenizer.c" \
     "$SOFTFLOAT_OBJ" \

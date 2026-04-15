@@ -3,14 +3,21 @@
 # Uses a 32-bit (i386) Debian base so the movfuscator, LCC, and the
 # resulting binary are all native 32-bit -- no cross-compilation needed.
 #
-# Build:
+# Works on any host (x86, x86_64, ARM/Apple Silicon) via Docker + QEMU.
+#
+# Build (x86 host):
 #   docker build -t emilio-mov -f mov/Dockerfile mov/
+#
+# Build (Apple Silicon / ARM host):
+#   docker build --platform linux/386 -t emilio-mov -f mov/Dockerfile mov/
 #
 # Extract the 100% MOV binary:
 #   docker run --rm -v $(pwd)/mov/build:/out emilio-mov
 #
 # Run with verification:
 #   docker run --rm -v $(pwd)/mov/build:/out emilio-mov --verify
+#
+# Or just use: ./test_mov.sh --docker
 #
 # The resulting emilio_mov binary will be copied to the mounted /out volume.
 

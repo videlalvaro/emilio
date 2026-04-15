@@ -383,6 +383,7 @@ char *tokenizer_decode(const Tokenizer *tok, const int *ids, int n)
                     cp |= ((unsigned char)p[3]) & 0x3F;
                     p += 4;
                 }
+                (void)cp;  /* value unused: we only count codepoints */
                 total++;  /* each codepoint maps to 1 byte */
             }
         }
