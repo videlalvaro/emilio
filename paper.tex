@@ -8,6 +8,7 @@
 \usepackage{amssymb}
 \usepackage{hyperref}
 \usepackage{subcaption}
+\usepackage{needspace}
 
 %% ── listings style ────────────────────────────────────────────────
 \definecolor{codebg}{gray}{0.96}
@@ -43,10 +44,11 @@
 \title{From One Primitive to Working LLM:\\
   Implementing and Optimizing\\ \texttt{eml(x,y) = exp(x) - ln(y)} for Transformer Inference}
 
+\renewcommand{\shorttitle}{EML Transformer Inference}
+
 \author{Alvaro Videla}
-\email{videlalvaro@gmail.com}
 \affiliation{%
-  \institution{Independent Researcher}
+  \institution{Microsoft}
 }
 
 \begin{abstract}
@@ -282,6 +284,7 @@ token---clearly impractical without optimization.
 
 \subsection{Verification}
 
+\needspace{10\baselineskip}
 \begin{lstlisting}[language=bash,caption={Running the Python POC.}]
 cd emilio/python
 python3 -m venv .venv && source .venv/bin/activate
@@ -902,6 +905,7 @@ cd ..
 This is the simplest path: load the GGUF, compute $\ln(W)$ on the fly,
 and run inference.
 
+\needspace{16\baselineskip}
 \begin{lstlisting}[language=bash,caption={GGUF inference (computes ln(W) at load time).}]
 cd emilio
 # CPU-only:
@@ -954,6 +958,7 @@ cargo run --bin emilio --release -- \
 
 The engine auto-detects v1 vs.\ v2 via magic bytes (\texttt{EML1}/\texttt{EML2}):
 
+\needspace{14\baselineskip}
 \begin{lstlisting}[language=bash,caption={Inference from compiled .eml files.}]
 # EML v1:
 cargo run --bin emilio --release -- \
@@ -1009,6 +1014,7 @@ python3 bench.py
 
 \subsection{Compare All Three Paths}
 
+\needspace{18\baselineskip}
 \begin{lstlisting}[language=bash,caption={Head-to-head comparison.}]
 cd emilio
 
@@ -1056,7 +1062,7 @@ Table~\ref{tab:audit} summarizes the findings and fixes applied.
 \label{tab:audit}
 \centering
 \small
-\begin{tabular}{llp{5.1cm}}
+\begin{tabular}{p{3.2cm}p{3.0cm}p{5.1cm}}
 \toprule
 \textbf{File / Function} & \textbf{Issue} & \textbf{Fix} \\
 \midrule
@@ -1065,18 +1071,18 @@ Table~\ref{tab:audit} summarizes the findings and fixes applied.
   & Replaced with \texttt{eml\_ln}, \texttt{eml\_exp}, \texttt{eml\_add}, \texttt{eml\_sub}, \texttt{eml\_mul}, \texttt{eml\_div} \\[3pt]
 \texttt{emilio.rs} / \texttt{eml\_silu}
   & Raw \texttt{/}, \texttt{.exp()}, \texttt{+}
-  & Replaced with \texttt{eml\_inv(eml\_add(ONE, eml\_exp(eml\_neg(x))))}, \texttt{eml\_mul} \\[3pt]
+  & Replaced with \texttt{eml\_inv(eml\_add(\ldots))}, \texttt{eml\_mul} \\[3pt]
 \texttt{emilio.rs} / bias additions
-  & Raw \texttt{+=} on 6 sites (Q, K, V~$\times$~2 paths)
-  & Replaced with \texttt{eml\_add(to\_c(...),...)} \\[3pt]
+  & Raw \texttt{+=} on 6~sites (Q, K, V~$\times$~2)
+  & Replaced with \texttt{eml\_add(to\_c(\ldots),\ldots)} \\[3pt]
 \texttt{emilio.rs} / RoPE
   & Raw \texttt{.cos()}, \texttt{.sin()}, \texttt{.powf()}
-  & Euler's formula: $\cos\theta + i\sin\theta = e^{i\theta}$ via \texttt{eml\_exp(Complex64::new(0, $\theta$))}; power via \texttt{eml\_exp(eml\_neg(eml\_mul(...)))} \\[3pt]
+  & Euler: $e^{i\theta}$ via \texttt{eml\_exp}; power via \texttt{eml\_exp(eml\_neg(\ldots))} \\[3pt]
 \texttt{eml\_optimizer.rs} / \texttt{eval\_expr}
-  & All 12 e-graph node types used raw operators
-  & Each routed through corresponding \texttt{eml\_ops} function \\[3pt]
+  & All 12 e-graph nodes used raw operators
+  & Each routed through \texttt{eml\_ops} \\[3pt]
 \texttt{eml\_optimizer.rs} / CSE builders
-  & \texttt{build\_softmax\_cse}, \texttt{build\_layernorm\_cse}, \texttt{build\_gelu\_cse}, \texttt{precompute\_ln\_weight} used raw ops
+  & \texttt{build\_softmax\_cse}, \texttt{precompute\_ln\_weight}, etc.\ used raw ops
   & All replaced with \texttt{eml\_ops} equivalents \\
 \bottomrule
 \end{tabular}
@@ -1106,13 +1112,13 @@ The fixed code compiles and produces identical inference output
 
 \paragraph{Automated enforcement.}
 To prevent regressions, we provide an integration test
-(\texttt{tests/purity\_audit.rs}) that scans every \texttt{.rs} source
+(\texttt{tests/\allowbreak purity\_audit.rs}) that scans every \texttt{.rs} source
 file for raw transcendental calls (\texttt{.exp()}, \texttt{.ln()},
 \texttt{.cos()}, \texttt{.sin()}, \texttt{.powf()}, etc.)\ outside of
 three exempt files (\texttt{eml\_ops.rs}, \texttt{autoeml\_kernel.rs},
 \texttt{autoeml\_reference.rs}).  Any raw call found in an audited file
 triggers a test failure unless the line carries an
-\texttt{EML\_AUDIT:OK} marker with a written justification.  A
+\texttt{EML\_AUDIT:\allowbreak OK} marker with a written justification.  A
 companion test verifies that every such marker includes its rationale.
 This test runs as part of the standard \texttt{cargo test} suite:
 
