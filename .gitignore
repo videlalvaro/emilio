@@ -33,3 +33,6 @@ Cargo.lock
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+
+# MOV build artifacts
+emilio/mov/build/
