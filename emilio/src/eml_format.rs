@@ -226,6 +226,8 @@ pub fn load_eml(path: &str) -> io::Result<(ModelWeights, Tokenizer)> {
         rms_norm_eps: read_f64(&mut r)?,
         max_seq_len: read_u32(&mut r)? as usize,
         d_head: read_u32(&mut r)? as usize,
+        eos_token_id: 151643,
+        eot_token_id: 151645,
     };
 
     // ── Tokenizer ──
@@ -522,6 +524,8 @@ pub fn load_eml_v2(path: &str) -> io::Result<(V2ModelWeights, Tokenizer)> {
         rms_norm_eps: read_f64(&mut r)?,
         max_seq_len: read_u32(&mut r)? as usize,
         d_head: read_u32(&mut r)? as usize,
+        eos_token_id: 151643,
+        eot_token_id: 151645,
     };
 
     let sparsity = SparsityStats {

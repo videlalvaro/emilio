@@ -59,7 +59,7 @@ fn print_usage() {
 
 fn cmd_profile(_args: &[String]) {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  AutoEML Profiler — Transcendental Budget Analysis          ║");
+    println!("║  AutoEML Profiler -- Transcendental Budget Analysis           ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -242,7 +242,7 @@ fn cmd_bench(args: &[String]) {
     let transposed = args.iter().any(|a| a == "--transposed");
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  AutoEML Benchmark — {}                             ║", autoeml_kernel::KERNEL_TYPE);
+    println!("║  AutoEML Benchmark -- {}                              ║", autoeml_kernel::KERNEL_TYPE);
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -424,7 +424,7 @@ fn bench_matmul(size: usize, iters: usize, use_precomp: bool, use_transposed: bo
 
 fn cmd_verify(_args: &[String]) {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  AutoEML Verification — All Operations                      ║");
+    println!("║  AutoEML Verification -- All Operations                       ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 

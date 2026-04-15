@@ -85,6 +85,7 @@ pub struct GpuWeights {
     pub cols: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl MetalContext {
     pub fn new() -> Result<Self, String> {
         let device = Device::system_default()
@@ -119,7 +120,7 @@ impl MetalContext {
     // ── Buffer helpers ──────────────────────────────────────────────
 
     fn new_buffer_with_data<T: Copy>(&self, data: &[T]) -> Buffer {
-        let byte_len = data.len() * mem::size_of::<T>();
+        let byte_len = std::mem::size_of_val(data);
         self.device.new_buffer_with_data(
             data.as_ptr() as *const std::ffi::c_void,
             byte_len as u64,
@@ -146,7 +147,7 @@ impl MetalContext {
         assert_eq!(ln_b_t.len(), n, "ln_b_t size mismatch");
 
         let mut mag_h: Vec<u16> = Vec::with_capacity(n);
-        let n_words = (n + 31) / 32;
+        let n_words = n.div_ceil(32);
         let mut sign_packed: Vec<u32> = vec![0u32; n_words];
         for (i, c) in ln_b_t.iter().enumerate() {
             mag_h.push(f32_to_f16(c.re as f32));
@@ -664,7 +665,7 @@ impl GpuModelWeights {
     fn total_bytes(layers: &[GpuLayerWeights], output: &GpuWeights) -> usize {
         let w_bytes = |w: &GpuWeights| {
             w.inner * w.cols * 2  // half mag
-            + ((w.inner * w.cols + 31) / 32) * 4  // packed sign bits
+            + (w.inner * w.cols).div_ceil(32) * 4  // packed sign bits
         };
         let layer_bytes: usize = layers.iter()
             .map(|l| w_bytes(&l.q) + w_bytes(&l.k) + w_bytes(&l.v) + w_bytes(&l.o)

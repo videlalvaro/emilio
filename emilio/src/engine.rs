@@ -31,6 +31,8 @@ pub struct QwenConfig {
     pub rms_norm_eps: f64,
     pub max_seq_len: usize,
     pub d_head: usize,
+    pub eos_token_id: usize,
+    pub eot_token_id: usize, // <|im_end|> for ChatML
 }
 
 impl QwenConfig {
@@ -53,6 +55,13 @@ impl QwenConfig {
             rms_norm_eps: gguf.meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-6) as f64,
             max_seq_len: gguf.meta_u32(&format!("{arch}.context_length")).unwrap_or(32768) as usize,
             d_head: d_model / n_heads,
+            eos_token_id: gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(151643) as usize,
+            eot_token_id: gguf.meta_u32("tokenizer.ggml.eot_token_id")
+                .or_else(|| {
+                    // Qwen2.5 ChatML: <|im_end|> = 151645
+                    Some(151645)
+                })
+                .unwrap() as usize,
         }
     }
 
@@ -238,7 +247,7 @@ pub fn eml_rms_norm(x: &[f64], gamma: &[f64], eps: f64) -> Vec<f64> {
     let two = to_c(2.0);
     let sq_sum: Complex64 = ln_x.iter()
         .map(|&lx| eml_exp(eml_mul(two, lx)))
-        .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+        .fold(Complex64::new(0.0, 0.0), eml_add);
 
     // mean(x²) = sq_sum / N via log domain: exp(ln(sq_sum) - ln(N))
     let mean_sq = eml_div(sq_sum, nc);
@@ -489,8 +498,8 @@ fn eml_gqa_attention_one(
     let mut v_new = build_matmul_cse_precomp(x, &layer.ln_v, 1, d, kv_dim);
 
     // Add bias (EML add — 0-cost, proven by cancellation)
-    for j in 0..q_dim {
-        q[j] = to_r(eml_add(to_c(q[j]), to_c(layer.q_bias[j])));
+    for (q_val, &bias) in q.iter_mut().zip(&layer.q_bias) {
+        *q_val = to_r(eml_add(to_c(*q_val), to_c(bias)));
     }
     for j in 0..kv_dim {
         k_new[j] = to_r(eml_add(to_c(k_new[j]), to_c(layer.k_bias[j])));
@@ -534,9 +543,9 @@ fn eml_gqa_attention_one(
         // Weighted sum over cached V
         for dd in 0..d_head {
             let mut acc = Complex64::new(0.0, 0.0);
-            for j in 0..t {
+            for (j, &w) in attn_w.iter().enumerate() {
                 let vv = kv.v[j * kv_dim + kv_h * d_head + dd];
-                acc = eml_add(acc, eml_mul(to_c(attn_w[j]), to_c(vv)));
+                acc = eml_add(acc, eml_mul(to_c(w), to_c(vv)));
             }
             out[h * d_head + dd] = to_r(acc);
         }
@@ -621,8 +630,8 @@ pub fn emilio_generate(
 
         eprint!("\r  Generated {}/{} tokens", step + 1, max_new);
 
-        // Stop on EOS
-        if next_token == cfg.vocab_size - 1 { break; } // fallback EOS
+        // Stop on EOS or end-of-turn (<|im_end|>)
+        if next_token == cfg.eos_token_id || next_token == cfg.eot_token_id { break; }
     }
     eprintln!();
 
@@ -634,6 +643,7 @@ pub fn emilio_generate(
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
 pub mod gpu {
     use super::*;
     use crate::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
@@ -730,8 +740,8 @@ pub mod gpu {
         );
 
         // Add bias (CPU — tiny vectors)
-        for j in 0..q_dim {
-            q[j] = to_r(eml_add(to_c(q[j]), to_c(layer.q_bias[j])));
+        for (q_val, &bias) in q.iter_mut().zip(&layer.q_bias) {
+            *q_val = to_r(eml_add(to_c(*q_val), to_c(bias)));
         }
         for j in 0..kv_dim {
             k_new[j] = to_r(eml_add(to_c(k_new[j]), to_c(layer.k_bias[j])));
@@ -772,9 +782,9 @@ pub mod gpu {
 
             for dd in 0..d_head {
                 let mut acc = Complex64::new(0.0, 0.0);
-                for j in 0..t {
+                for (j, &w) in attn_w.iter().enumerate() {
                     let vv = kv.v[j * kv_dim + kv_h * d_head + dd];
-                    acc = eml_add(acc, eml_mul(to_c(attn_w[j]), to_c(vv)));
+                    acc = eml_add(acc, eml_mul(to_c(w), to_c(vv)));
                 }
                 out[h * d_head + dd] = to_r(acc);
             }
@@ -831,7 +841,7 @@ pub mod gpu {
             ids.push(next_token);
             eprint!("\r  Generated {}/{} tokens (GPU)", step + 1, max_new);
 
-            if next_token == cfg.vocab_size - 1 { break; }
+            if next_token == cfg.eos_token_id || next_token == cfg.eot_token_id { break; }
         }
         eprintln!();
 

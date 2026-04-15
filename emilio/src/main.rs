@@ -11,7 +11,7 @@ use std::process;
 fn main() {
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  EML-LLM: Tiny Transformer via eml(x,y) = exp(x)-ln(y) ║");
+    println!("║  EML-LLM: Tiny Transformer via eml(x,y) = exp(x)-ln(y)   ║");
     println!("║  Based on: Odrzywołek (2026), arXiv:2603.21852           ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();

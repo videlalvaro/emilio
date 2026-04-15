@@ -184,11 +184,11 @@ impl TensorInfo {
             GGMLType::F16 => n * 2,
             GGMLType::Q8_0 => {
                 // Q8_0: blocks of 32 values, each block = 2 bytes (f16 scale) + 32 bytes (int8)
-                let n_blocks = (n + 31) / 32;
+                let n_blocks = n.div_ceil(32);
                 n_blocks * 34
             }
             GGMLType::Q4_0 => {
-                let n_blocks = (n + 31) / 32;
+                let n_blocks = n.div_ceil(32);
                 n_blocks * 18 // 2 bytes f16 + 16 bytes (32 * 4-bit)
             }
             GGMLType::BF16 => n * 2,
@@ -356,7 +356,7 @@ impl GGUFFile {
 
         // Version
         let version = read_u32(&mut r)?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("unsupported GGUF version: {version}")));
         }
@@ -393,7 +393,7 @@ impl GGUFFile {
         let alignment = metadata.get("general.alignment")
             .and_then(|v| v.as_u32())
             .unwrap_or(32) as u64;
-        let data_offset = (header_end + alignment - 1) / alignment * alignment;
+        let data_offset = header_end.div_ceil(alignment) * alignment;
 
         Ok(GGUFFile {
             version,
@@ -528,7 +528,7 @@ impl GGUFFile {
 // Dequantized value = int8_val * delta
 
 fn dequant_q8_0(r: &mut impl Read, n_elements: usize) -> io::Result<Vec<f64>> {
-    let n_blocks = (n_elements + 31) / 32;
+    let n_blocks = n_elements.div_ceil(32);
     let mut result = Vec::with_capacity(n_blocks * 32);
 
     for _ in 0..n_blocks {

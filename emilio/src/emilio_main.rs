@@ -15,6 +15,131 @@ use std::time::Instant;
 #[cfg(feature = "metal")]
 use emilio::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
 
+// ─── Result box formatter ───────────────────────────────────────────────────
+
+/// Count display width (number of terminal columns).
+fn display_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Escape control characters for single-line display.
+fn escape_for_box(s: &str) -> String {
+    s.replace('\n', " ").replace('\r', "").replace('\t', " ")
+}
+
+/// Word-wrap `text` into lines of at most `max_w` display columns.
+fn wrap_lines(text: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 { return vec![text.to_string()]; }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w: usize = 0;
+    for word in text.split(' ') {
+        let ww = display_width(word);
+        if cur.is_empty() {
+            cur = word.to_string();
+            cur_w = ww;
+        } else if cur_w + 1 + ww <= max_w {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + ww;
+        } else {
+            lines.push(cur);
+            cur = word.to_string();
+            cur_w = ww;
+        }
+    }
+    if !cur.is_empty() { lines.push(cur); }
+    if lines.is_empty() { lines.push(String::new()); }
+    lines
+}
+
+/// Get terminal width, falling back to 100.
+fn term_width() -> usize {
+    // Try $COLUMNS first, then a sensible default
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+}
+
+/// Print a neatly formatted result box that auto-sizes to content,
+/// word-wrapping long text to fit the terminal.
+///
+/// ```text
+///   ┌─────────────────────────────────────────────────────────────────────┐
+///   │  Prompt:     What is the capital of Uruguay and why is it          │
+///   │              important in South American history?                   │
+///   │  Generated:  The capital of Uruguay is Montevideo.                  │
+///   │  Tokens:     16 (ids: [17, 10, 17, ...])                           │
+///   │  Time:       7.18s  (2.23 tok/s)                                   │
+///   └─────────────────────────────────────────────────────────────────────┘
+/// ```
+fn print_result_box(prompt: &str, generated: &str, token_ids: &[usize], secs: f64) {
+    let gen_esc = escape_for_box(generated);
+    let n_tok = token_ids.len();
+    let tok_s = if secs > 0.0 { n_tok as f64 / secs } else { 0.0 };
+
+    // Build token ID preview — truncate if too many
+    let ids_str = if n_tok <= 8 {
+        format!("{:?}", token_ids)
+    } else {
+        let head: Vec<String> = token_ids[..6].iter().map(|t| t.to_string()).collect();
+        format!("[{}, ...]", head.join(", "))
+    };
+    let tok_line = format!("{n_tok} (ids: {ids_str})");
+    let time_line = format!("{secs:.2}s  ({tok_s:.2} tok/s)");
+
+    // Label column: "Generated:  " = 13 chars (widest label + padding)
+    let label_w: usize = 13;
+    //   Box chrome: "  │  " (5) + label_w + "  │" (3) = 21 fixed chars
+    let chrome: usize = 5 + label_w + 3;
+    let max_val_w = term_width().saturating_sub(chrome).max(20);
+
+    // Rows: (label, value)
+    // Prompt preserves newlines (split into sub-lines); others are single-line.
+    let rows: Vec<(&str, Vec<&str>)> = vec![
+        ("Prompt:", prompt.lines().collect()),
+        ("Generated:", vec![&gen_esc]),
+        ("Tokens:", vec![&tok_line]),
+        ("Time:", vec![&time_line]),
+    ];
+
+    // Word-wrap each value and build display lines
+    let mut all_lines: Vec<String> = Vec::new();
+    let mut max_row_w: usize = 0;
+    for (label, sub_lines) in &rows {
+        let mut first = true;
+        for sub in sub_lines {
+            let cleaned = escape_for_box(sub);
+            let wrapped = wrap_lines(&cleaned, max_val_w);
+            for (i, line) in wrapped.iter().enumerate() {
+                let formatted = if first && i == 0 {
+                    let pad = label_w.saturating_sub(display_width(label));
+                    format!("{label}{}{line}", " ".repeat(pad))
+                } else {
+                    format!("{}{line}", " ".repeat(label_w))
+                };
+                let w = display_width(&formatted);
+                if w > max_row_w { max_row_w = w; }
+                all_lines.push(formatted);
+            }
+            first = false;
+        }
+    }
+
+    // Box inner width = widest row + 4 (2 spaces each side)
+    let inner = max_row_w + 4;
+
+    // Draw
+    println!();
+    println!("  ┌{}┐", "─".repeat(inner));
+    for row in &all_lines {
+        let pad = inner.saturating_sub(display_width(row) + 4);
+        println!("  │  {row}{}  │", " ".repeat(pad));
+    }
+    println!("  └{}┘", "─".repeat(inner));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -46,8 +171,8 @@ fn main() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  emilio — EML inference engine                          ║");
-    println!("║  Every result flows through eml(x,y) = exp(x) - ln(y)  ║");
+    println!("║  emilio -- EML inference engine                          ║");
+    println!("║  Every result flows through eml(x,y) = exp(x) - ln(y)    ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 
@@ -101,7 +226,7 @@ fn run_from_eml(model_path: &str, mode: &str, args: &[String]) {
             let prompt_ids = tokenizer.encode(text);
             println!("  Tokenized: \"{}\" → {} tokens: {:?}",
                 text, prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
-            generate_with_weights(&weights, &prompt_ids, &tokenizer);
+            generate_with_weights(&weights, &prompt_ids, &tokenizer, None);
         }
         "--chat" => {
             let msg = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
@@ -109,7 +234,8 @@ fn run_from_eml(model_path: &str, mode: &str, args: &[String]) {
             println!("  Chat prompt: \"{msg}\"");
             println!("  Tokenized to {} tokens: {:?}...",
                 prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
-            generate_with_weights(&weights, &prompt_ids, &tokenizer);
+            let chat_display = format!("system: You are a helpful assistant.\nuser: {msg}");
+            generate_with_weights(&weights, &prompt_ids, &tokenizer, Some(&chat_display));
         }
         "--tokens" => {
             let tok_str = args.get(3).map(|s| s.as_str()).unwrap_or("1,2,3");
@@ -177,15 +303,7 @@ fn run_from_eml_v2(model_path: &str, mode: &str, args: &[String]) {
             let prompt_text = tokenizer.decode(&prompt_ids);
             let generated_text = tokenizer.decode(generated);
 
-            println!();
-            println!("  ┌─────────────────────────────────────────────────");
-            println!("  │ Prompt:    \"{}\"", prompt_text);
-            println!("  │ Generated: \"{}\"", generated_text);
-            println!("  │ Token IDs: {:?}", generated);
-            println!("  └─────────────────────────────────────────────────");
-            println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
-                generated.len() as f64 / gen_s);
-            println!();
+            print_result_box(&prompt_text, &generated_text, generated, gen_s);
             println!("  v2: sign+mag kernel, fused QKV/gate_up, {:.1}% pruned.",
                 100.0 * weights.sparsity.pruned_params as f64 / weights.sparsity.total_params.max(1) as f64);
         }
@@ -207,14 +325,8 @@ fn run_from_eml_v2(model_path: &str, mode: &str, args: &[String]) {
             let generated = &output[prompt_ids.len()..];
             let generated_text = tokenizer.decode(generated);
 
-            println!();
-            println!("  ┌─────────────────────────────────────────────────");
-            println!("  │ Prompt:    \"{msg}\"");
-            println!("  │ Generated: \"{}\"", generated_text);
-            println!("  │ Token IDs: {:?}", generated);
-            println!("  └─────────────────────────────────────────────────");
-            println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
-                generated.len() as f64 / gen_s);
+            let chat_display = format!("system: You are a helpful assistant.\nuser: {msg}");
+            print_result_box(&chat_display, &generated_text, generated, gen_s);
         }
         _ => {
             eprintln!("Unknown mode for .eml v2: {mode} (use --generate or --chat)");
@@ -223,7 +335,7 @@ fn run_from_eml_v2(model_path: &str, mode: &str, args: &[String]) {
     }
 }
 
-fn run_from_gguf(model_path: &str, mode: &str, args: &[String], use_gpu: bool) {
+fn run_from_gguf(model_path: &str, mode: &str, args: &[String], _use_gpu: bool) {
     // ── Parse GGUF ─────────────────────────────────────────────────
     println!("Loading GGUF: {model_path}");
     let t0 = Instant::now();
@@ -268,11 +380,11 @@ fn run_from_gguf(model_path: &str, mode: &str, args: &[String], use_gpu: bool) {
             println!("  Tokenized: \"{}\" → {} tokens: {:?}",
                 text, prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
             #[cfg(feature = "metal")]
-            if use_gpu {
-                generate_metal(&gguf, &prompt_ids, tok);
+            if _use_gpu {
+                generate_metal(&gguf, &prompt_ids, tok, None);
                 return;
             }
-            generate(&gguf, &prompt_ids, tok);
+            generate(&gguf, &prompt_ids, tok, None);
         }
         "--chat" => {
             let msg = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
@@ -281,12 +393,13 @@ fn run_from_gguf(model_path: &str, mode: &str, args: &[String], use_gpu: bool) {
             println!("  Chat prompt: \"{msg}\"");
             println!("  Tokenized to {} tokens: {:?}...",
                 prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+            let chat_display = format!("system: You are a helpful assistant.\nuser: {msg}");
             #[cfg(feature = "metal")]
-            if use_gpu {
-                generate_metal(&gguf, &prompt_ids, tok);
+            if _use_gpu {
+                generate_metal(&gguf, &prompt_ids, tok, Some(&chat_display));
                 return;
             }
-            generate(&gguf, &prompt_ids, tok);
+            generate(&gguf, &prompt_ids, tok, Some(&chat_display));
         }
         "--tokens" => {
             let tok_str = args.get(3).map(|s| s.as_str()).unwrap_or("1,2,3");
@@ -506,7 +619,7 @@ fn explore(gguf: &GGUFFile) {
     }
 }
 
-fn generate(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
+fn generate(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer, display_prompt: Option<&str>) {
     println!("Loading model weights...");
     let t0 = Instant::now();
     let weights = match ModelWeights::from_gguf(gguf) {
@@ -537,18 +650,12 @@ fn generate(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
     let gen_s = t1.elapsed().as_secs_f64();
 
     let generated = &output[prompt.len()..];
-    let prompt_text = tok.decode(prompt);
+    let prompt_text = display_prompt
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| tok.decode(prompt));
     let generated_text = tok.decode(generated);
 
-    println!();
-    println!("  ┌─────────────────────────────────────────────────");
-    println!("  │ Prompt:    \"{}\"", prompt_text);
-    println!("  │ Generated: \"{}\"", generated_text);
-    println!("  │ Token IDs: {:?}", generated);
-    println!("  └─────────────────────────────────────────────────");
-    println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
-        generated.len() as f64 / gen_s);
-    println!();
+    print_result_box(&prompt_text, &generated_text, generated, gen_s);
     println!("  Every multiply was exp(ln(a) + ln(b)).");
     println!("  Every division was exp(ln(a) - ln(b)).");
 }
@@ -591,7 +698,7 @@ fn generate_raw(gguf: &GGUFFile, prompt: &[usize], tok: Option<&Tokenizer>) {
         generated.len() as f64 / gen_s);
 }
 
-fn generate_with_weights(weights: &ModelWeights, prompt: &[usize], tok: &Tokenizer) {
+fn generate_with_weights(weights: &ModelWeights, prompt: &[usize], tok: &Tokenizer, display_prompt: Option<&str>) {
     let rope = RopeCache::new(
         weights.config.d_head,
         weights.config.max_seq_len.min(2048),
@@ -610,18 +717,12 @@ fn generate_with_weights(weights: &ModelWeights, prompt: &[usize], tok: &Tokeniz
     let gen_s = t1.elapsed().as_secs_f64();
 
     let generated = &output[prompt.len()..];
-    let prompt_text = tok.decode(prompt);
+    let prompt_text = display_prompt
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| tok.decode(prompt));
     let generated_text = tok.decode(generated);
 
-    println!();
-    println!("  ┌─────────────────────────────────────────────────");
-    println!("  │ Prompt:    \"{}\"", prompt_text);
-    println!("  │ Generated: \"{}\"", generated_text);
-    println!("  │ Token IDs: {:?}", generated);
-    println!("  └─────────────────────────────────────────────────");
-    println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
-        generated.len() as f64 / gen_s);
-    println!();
+    print_result_box(&prompt_text, &generated_text, generated, gen_s);
     println!("  Every multiply was exp(ln(a) + ln(b)).");
     println!("  Every division was exp(ln(a) - ln(b)).");
 }
@@ -653,7 +754,7 @@ fn generate_raw_with_weights(weights: &ModelWeights, prompt: &[usize], tok: Opti
 }
 
 #[cfg(feature = "metal")]
-fn generate_metal(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
+fn generate_metal(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer, display_prompt: Option<&str>) {
     println!("Loading model weights...");
     let t0 = Instant::now();
     let weights = match ModelWeights::from_gguf(gguf) {
@@ -710,18 +811,12 @@ fn generate_metal(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
     let gen_s = t1.elapsed().as_secs_f64();
 
     let generated = &output[prompt.len()..];
-    let prompt_text = tok.decode(prompt);
+    let prompt_text = display_prompt
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| tok.decode(prompt));
     let generated_text = tok.decode(generated);
 
-    println!();
-    println!("  ┌─────────────────────────────────────────────────");
-    println!("  │ Prompt:    \"{}\"", prompt_text);
-    println!("  │ Generated: \"{}\"", generated_text);
-    println!("  │ Token IDs: {:?}", generated);
-    println!("  └─────────────────────────────────────────────────");
-    println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
-        generated.len() as f64 / gen_s);
-    println!();
+    print_result_box(&prompt_text, &generated_text, generated, gen_s);
     println!("  Metal GPU: exp() kernel on GPU, ln()/norm/RoPE on CPU.");
-    println!("  Every multiply was exp(ln(a) + ln(b)) — on the GPU.");
+    println!("  Every multiply was exp(ln(a) + ln(b)) -- on the GPU.");
 }

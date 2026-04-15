@@ -84,7 +84,7 @@ impl CostFunction<EmlLang> for EmlCost {
     where
         C: FnMut(Id) -> f64,
     {
-        let op_cost = match enode {
+        match enode {
             // Leaves — free
             EmlLang::Const(_) | EmlLang::Var(_) => 0.0,
 
@@ -117,8 +117,7 @@ impl CostFunction<EmlLang> for EmlCost {
             EmlLang::Gelu([x]) => 5.0 + costs(*x),  // 2 exp + 3 ln
             // sigmoid(z) = inv(1 + exp(-z)) → 1 exp + 1 ln = 2
             EmlLang::Sigmoid([x]) => 2.0 + costs(*x),
-        };
-        op_cost
+        }
     }
 }
 
@@ -658,7 +657,7 @@ pub fn build_layernorm_cse(
             // 1. Mean via EML: sum (0-cost adds), div = exp(ln(sum) - ln(N))
             let sum: Complex64 = row.iter()
                 .map(|&v| to_c(v))
-                .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+                .fold(Complex64::new(0.0, 0.0), eml_add);
             let mean = eml_exp(eml_sub(eml_ln(sum), ln_n));  // div via log domain
 
             // 2. Diffs and their logs (complex — preserves sign via iπ)
@@ -674,7 +673,7 @@ pub fn build_layernorm_cse(
             let two = to_c(2.0);
             let sq_sum: Complex64 = ln_diffs.iter()
                 .map(|&ld| eml_exp(eml_mul(two, ld)))
-                .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+                .fold(Complex64::new(0.0, 0.0), eml_add);
             let var = eml_exp(eml_sub(eml_ln(sq_sum), ln_n));  // div via log domain
 
             // 4. std = sqrt(var + eps) = exp(0.5 * ln(var + eps))
@@ -710,7 +709,7 @@ pub fn build_softmax_cse(x: &[f64]) -> Vec<f64> {
     // Z = sum — add is 0-cost
     let z: Complex64 = exps.iter()
         .map(|&e| to_c(e))
-        .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+        .fold(Complex64::new(0.0, 0.0), eml_add);
 
     // ln(Z) — computed ONCE (the CSE payoff)
     let ln_z = eml_ln(z);

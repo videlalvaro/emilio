@@ -97,7 +97,7 @@ impl SmTensor {
 
     /// Pack signs into bitmap: bit k%8 of byte k/8 is 1 if sign is negative.
     pub fn pack_signs(&self) -> Vec<u8> {
-        let nbytes = (self.len + 7) / 8;
+        let nbytes = self.len.div_ceil(8);
         let mut packed = vec![0u8; nbytes];
         for (i, &s) in self.signs.iter().enumerate() {
             if s < 0.0 {
@@ -456,8 +456,8 @@ fn v2_gqa_attention_one(
     let mut v_new = qkv[q_dim + kv_dim..].to_vec();
 
     // Add bias
-    for j in 0..q_dim {
-        q[j] += layer.q_bias[j];
+    for (q_val, &bias) in q.iter_mut().zip(&layer.q_bias) {
+        *q_val += bias;
     }
     for j in 0..kv_dim {
         k_new[j] += layer.k_bias[j];
@@ -498,9 +498,9 @@ fn v2_gqa_attention_one(
 
         for dd in 0..d_head {
             let mut acc = Complex64::new(0.0, 0.0);
-            for j in 0..t {
+            for (j, &w) in attn_w.iter().enumerate() {
                 let vv = kv.v[j * kv_dim + kv_h * d_head + dd];
-                acc = eml_add(acc, eml_mul(to_c(attn_w[j]), to_c(vv)));
+                acc = eml_add(acc, eml_mul(to_c(w), to_c(vv)));
             }
             out[h * d_head + dd] = to_r(acc);
         }
