@@ -1,4 +1,4 @@
-# em2 — EML Inference Engine
+# emilio — EML Inference Engine
 
 A complete LLM inference engine where **every multiplication is `exp(ln(a) + ln(b))`**.
 
@@ -9,7 +9,7 @@ eml(x, y) = exp(x) − ln(y)
 ```
 
 This single operation — one exponentiation, one logarithm, one subtraction — can express
-all of arithmetic, linear algebra, and the full transformer forward pass. **em2** proves
+all of arithmetic, linear algebra, and the full transformer forward pass. **emilio** proves
 this by running Qwen2.5-0.5B-Instruct (494M parameters) entirely through EML, producing
 correct English at ~5.5 tok/s (CPU) and ~30 tok/s (GPU) on Apple Silicon.
 
@@ -23,9 +23,9 @@ a single algebraic identity suffices for every operation in a production transfo
 |---|---|
 | `emilio/` | **emilio** — Rust inference engine (CPU + Metal GPU) |
 | `emilio/src/eml_matmul.metal` | Metal shaders (4 pure-EML kernels) |
-| `eml_core.py` | Python proof-of-concept with instrumented EML call counts |
-| `eml_model.py` | Python model loader (GGUF → EML forward pass) |
-| `verify.py` | Correctness verification (Python vs reference) |
+| `python/eml_core.py` | Python proof-of-concept with instrumented EML call counts |
+| `python/eml_model.py` | Python model loader (GGUF → EML forward pass) |
+| `python/verify.py` | Correctness verification (Python vs reference) |
 | `compile_model.sh` | Compile GGUF → `.eml` format |
 | `paper.tex` | The paper |
 | `paper.pdf` | Pre-built PDF of the paper |
@@ -154,6 +154,7 @@ cargo run --bin autoeml --release -- bench --transposed --size 896 --iters 10
 
 ```bash
 # Python: verify EML forward pass matches reference
+cd python
 python3 verify.py
 
 # Rust: verify Rust engine matches Python reference

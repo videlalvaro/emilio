@@ -283,7 +283,7 @@ token---clearly impractical without optimization.
 \subsection{Verification}
 
 \begin{lstlisting}[language=bash,caption={Running the Python POC.}]
-cd em2
+cd emilio/python
 python3 -m venv .venv && source .venv/bin/activate
 pip install numpy
 python3 verify.py    # Tests all identities + forward pass
@@ -875,13 +875,13 @@ all intermediate precision is f32 in both paths.
 \section{Reproduction}
 \label{sec:reproduce}
 
-All code is in the \texttt{em2} repository.  Prerequisites: Rust
+All code is in the \texttt{emilio} repository.  Prerequisites: Rust
 $\geq$1.75, Python~3.10+, NumPy, $\sim$10\,GB disk for model files.
 
 \subsection{Build the Rust Engine}
 
 \begin{lstlisting}[language=bash,caption={Building emilio.}]
-cd em2/emilio
+cd emilio/emilio
 cargo build --bin emilio --release            # CPU-only
 cargo build --bin emilio --release --features metal  # GPU
 cargo build --bin autoeml --release
@@ -996,7 +996,7 @@ done
 \subsection{Run the Python Benchmarks}
 
 \begin{lstlisting}[language=bash,caption={Python POC: verification and benchmarks.}]
-cd em2
+cd emilio/python
 source .venv/bin/activate
 pip install numpy
 
