@@ -37,3 +37,19 @@ Cargo.lock
 # MOV build artifacts
 emilio/mov/build/
 emilio/tag/build/
+
+# Private API exploration (archived)
+emilio/gol-ane/_private_api_archive/
+
+# GOL-ANE generated artifacts (rebuild with build.sh / gguf_to_ane.py)
+emilio/gol-ane/*.mlpackage/
+emilio/gol-ane/*.mlmodelc/
+emilio/gol-ane/*_embd.bin
+emilio/gol-ane/*_tokenizer.json
+emilio/gol-ane/*_meta.json
+emilio/gol-ane/gol_ane
+emilio/gol-ane/qwen_ane
+emilio/gol-ane/qwen_conv
+emilio/gol-ane/qwen_ane_direct
+emilio/gol-ane/bench_*
+emilio/gol-ane/energy_results/
