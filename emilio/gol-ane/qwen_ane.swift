@@ -252,6 +252,8 @@ func main() throws {
     var prompt = "The meaning of life is"
     var maxTokens = 64
     var useChatML = true
+    var useFixed = false
+    var useStateful = false
 
     var i = 0
     while i < args.count {
@@ -264,12 +266,23 @@ func main() throws {
             maxTokens = Int(args[i + 1])!; i += 2
         case "--raw":
             useChatML = false; i += 1
+        case "--fixed":
+            useFixed = true; i += 1
+        case "--stateful":
+            useStateful = true; i += 1
         default:
             i += 1
         }
     }
 
-    let prefix = "QwenANE_\(nLayers)L"
+    let prefix: String
+    if useStateful {
+        prefix = "QwenANE_\(nLayers)L_stateful"
+    } else if useFixed {
+        prefix = "QwenANE_\(nLayers)L_fixed"
+    } else {
+        prefix = "QwenANE_\(nLayers)L"
+    }
 
     // ── Load config ──
     print("Loading \(prefix)...")
@@ -327,14 +340,20 @@ func main() throws {
 
     let maxSeq = cfg.maxSeqLen
 
-    // Pre-allocated KV cache in (nkv, maxSeq, dh) layout — Stepanov
-    // Stored as contiguous Float16 — Dragon Book strength reduction
-    var kCacheData = [[Float16]](repeating:
-        [Float16](repeating: 0, count: cfg.nKvHeads * maxSeq * cfg.dHead),
-        count: cfg.nLayers)
-    var vCacheData = [[Float16]](repeating:
-        [Float16](repeating: 0, count: cfg.nKvHeads * maxSeq * cfg.dHead),
-        count: cfg.nLayers)
+    // Pre-allocated KV cache as raw pointers — Stepanov: allocate once
+    // Layout: (nKvHeads, maxSeq, dHead) per layer — Iverson: match consumption shape
+    // Dragon Book: raw pointer eliminates Array bounds-checking + CoW overhead
+    let kvElems = cfg.nKvHeads * maxSeq * cfg.dHead
+    let kCachePtr = (0..<cfg.nLayers).map { _ -> UnsafeMutablePointer<Float16> in
+        let p = UnsafeMutablePointer<Float16>.allocate(capacity: kvElems)
+        p.initialize(repeating: 0, count: kvElems)
+        return p
+    }
+    let vCachePtr = (0..<cfg.nLayers).map { _ -> UnsafeMutablePointer<Float16> in
+        let p = UnsafeMutablePointer<Float16>.allocate(capacity: kvElems)
+        p.initialize(repeating: 0, count: kvElems)
+        return p
+    }
     var cacheSeqLen = 0
 
     print("  Model loaded ✓")
@@ -358,24 +377,250 @@ func main() throws {
     var tExtract: Double = 0 // Host: extract outputs + append KV
     var nForward: Int = 0
 
-    // ── Forward one token through ANE ──
-    func forwardOne(tokenId: Int, pos: Int) throws -> Int {
+    // ═══════════════════════════════════════════════════════════════════
+    // Pre-allocated input buffers — Stepanov: regular types with
+    // fixed orbit. Allocate once, overwrite each forward call.
+    // Eliminates 51 MLMultiArray mallocs + 48 memcpys per token.
+    // ═══════════════════════════════════════════════════════════════════
+    let xArr = try MLMultiArray(
+        shape: [1, NSNumber(value: cfg.dModel), 1, 1], dataType: .float16)
+    let xPtr = xArr.dataPointer.assumingMemoryBound(to: Float16.self)
+    let cosArr = try MLMultiArray(shape: [1, NSNumber(value: dHalf)], dataType: .float16)
+    let cosPtr = cosArr.dataPointer.assumingMemoryBound(to: Float16.self)
+    let sinArr = try MLMultiArray(shape: [1, NSNumber(value: dHalf)], dataType: .float16)
+    let sinPtr = sinArr.dataPointer.assumingMemoryBound(to: Float16.self)
+
+    // Pre-build key strings (avoid String interpolation in hot path)
+    let kCacheKeys = (0..<cfg.nLayers).map { "k_cache_\($0)" }
+    let vCacheKeys = (0..<cfg.nLayers).map { "v_cache_\($0)" }
+    let newKKeys = (0..<cfg.nLayers).map { "new_k_\($0)" }
+    let newVKeys = (0..<cfg.nLayers).map { "new_v_\($0)" }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Fixed-shape mode: pre-allocated masks + full-size KV views
+    // Eliminates ALL dynamic shapes → ANE never replans execution graph.
+    // attn_mask:     (1, 1, 1, maxSeq) — 0 valid, -1e4 masked
+    // kv_write_mask: (1, 1, maxSeq, 1) — 1.0 at write position, 0 elsewhere
+    // ═══════════════════════════════════════════════════════════════════
+    let attnMaskArr: MLMultiArray?
+    let attnMaskPtr: UnsafeMutablePointer<Float16>?
+    let kvWriteMaskArr: MLMultiArray?
+    let kvWriteMaskPtr: UnsafeMutablePointer<Float16>?
+    // Fixed-mode KV views: always (1, nkv, maxSeq, dh) — truly zero-copy
+    let fixedKViews: [MLMultiArray]?
+    let fixedVViews: [MLMultiArray]?
+
+    if useFixed || useStateful {
+        let am = try MLMultiArray(
+            shape: [1, 1, 1, NSNumber(value: maxSeq)], dataType: .float16)
+        let amp = am.dataPointer.assumingMemoryBound(to: Float16.self)
+        // Initialize all masked
+        for j in 0..<maxSeq { amp[j] = Float16(-10000.0) }
+        attnMaskArr = am
+        attnMaskPtr = amp
+
+        let wm = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: maxSeq), 1], dataType: .float16)
+        let wmp = wm.dataPointer.assumingMemoryBound(to: Float16.self)
+        for j in 0..<maxSeq { wmp[j] = 0 }
+        kvWriteMaskArr = wm
+        kvWriteMaskPtr = wmp
+
+        if useFixed {
+            // Pre-build KV cache views — these never change shape
+            var kViews = [MLMultiArray]()
+            var vViews = [MLMultiArray]()
+            for layer in 0..<cfg.nLayers {
+                let kv = try MLMultiArray(
+                    dataPointer: UnsafeMutableRawPointer(kCachePtr[layer]),
+                    shape: [1, NSNumber(value: cfg.nKvHeads), NSNumber(value: maxSeq), NSNumber(value: cfg.dHead)],
+                    dataType: .float16,
+                    strides: [
+                        NSNumber(value: cfg.nKvHeads * maxSeq * cfg.dHead),
+                        NSNumber(value: maxSeq * cfg.dHead),
+                        NSNumber(value: cfg.dHead),
+                        NSNumber(value: 1)
+                    ],
+                    deallocator: nil
+                )
+                let vv = try MLMultiArray(
+                    dataPointer: UnsafeMutableRawPointer(vCachePtr[layer]),
+                    shape: [1, NSNumber(value: cfg.nKvHeads), NSNumber(value: maxSeq), NSNumber(value: cfg.dHead)],
+                    dataType: .float16,
+                    strides: [
+                        NSNumber(value: cfg.nKvHeads * maxSeq * cfg.dHead),
+                        NSNumber(value: maxSeq * cfg.dHead),
+                        NSNumber(value: cfg.dHead),
+                        NSNumber(value: 1)
+                    ],
+                    deallocator: nil
+                )
+                kViews.append(kv)
+                vViews.append(vv)
+            }
+            fixedKViews = kViews
+            fixedVViews = vViews
+            print("  Fixed-shape mode: masks + full KV views pre-allocated ✓")
+        } else {
+            fixedKViews = nil
+            fixedVViews = nil
+        }
+    } else {
+        attnMaskArr = nil
+        attnMaskPtr = nil
+        kvWriteMaskArr = nil
+        kvWriteMaskPtr = nil
+        fixedKViews = nil
+        fixedVViews = nil
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Stateful mode: MLState keeps KV cache on-device (ANE).
+    // Zero host↔ANE KV data transfer. Only x, rope, masks cross the bus.
+    // ═══════════════════════════════════════════════════════════════════
+    var mlState: MLState? = nil
+    if useStateful {
+        if #available(macOS 15.0, *) {
+            mlState = model.makeState()
+            print("  Stateful mode: MLState created (KV on-device) ✓")
+        } else {
+            print("ERROR: Stateful mode requires macOS 15.0+")
+            return
+        }
+    }
+
+    // ── Forward one token through ANE (stateful — zero KV copy) ──
+    func forwardOneStateful(tokenId: Int, pos: Int) throws -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let embedding = embd.lookup(tokenId)
+        let seq = cacheSeqLen
+
+        // x: overwrite pre-allocated buffer
+        for j in 0..<cfg.dModel { xPtr[j] = Float16(embedding[j]) }
+
+        // RoPE
+        let ropePos = min(pos, cfg.ropeCos.count - 1)
+        for j in 0..<dHalf {
+            cosPtr[j] = Float16(cfg.ropeCos[ropePos][j])
+            sinPtr[j] = Float16(cfg.ropeSin[ropePos][j])
+        }
+
+        // attn_mask: unmask position seq
+        attnMaskPtr![seq] = 0
+        // kv_write_mask: clear previous, set current
+        if seq > 0 { kvWriteMaskPtr![seq - 1] = 0 }
+        kvWriteMaskPtr![seq] = Float16(1.0)
+
+        // Only 5 inputs — NO KV cache arrays at all!
+        let inputDict: [String: MLFeatureValue] = [
+            "x": MLFeatureValue(multiArray: xArr),
+            "rope_cos": MLFeatureValue(multiArray: cosArr),
+            "rope_sin": MLFeatureValue(multiArray: sinArr),
+            "attn_mask": MLFeatureValue(multiArray: attnMaskArr!),
+            "kv_write_mask": MLFeatureValue(multiArray: kvWriteMaskArr!),
+        ]
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        let provider = try MLDictionaryFeatureProvider(dictionary: inputDict)
+        if #available(macOS 15.0, *) {
+            let result = try model.prediction(from: provider, using: mlState!)
+            let t2 = CFAbsoluteTimeGetCurrent()
+
+            // No KV extraction needed — state is updated internally on-device
+            cacheSeqLen += 1
+
+            let logits = result.featureValue(for: "logits")!.multiArrayValue!
+            let t3 = CFAbsoluteTimeGetCurrent()
+            tPack += t1 - t0
+            tPredict += t2 - t1
+            tExtract += t3 - t2
+            nForward += 1
+            return argmax(logits)
+        }
+        fatalError("Stateful requires macOS 15+")
+    }
+
+    // ── Forward one token through ANE (fixed-shape) ──
+    func forwardOneFixed(tokenId: Int, pos: Int) throws -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let embedding = embd.lookup(tokenId)
+        let seq = cacheSeqLen
+
+        // x: overwrite pre-allocated buffer
+        for j in 0..<cfg.dModel { xPtr[j] = Float16(embedding[j]) }
+
+        // RoPE
+        let ropePos = min(pos, cfg.ropeCos.count - 1)
+        for j in 0..<dHalf {
+            cosPtr[j] = Float16(cfg.ropeCos[ropePos][j])
+            sinPtr[j] = Float16(cfg.ropeSin[ropePos][j])
+        }
+
+        // attn_mask: unmask position seq (0=valid for positions 0..seq)
+        // On first call (seq=0), position 0 is unmasked.
+        // On subsequent calls, we unmask one more position.
+        attnMaskPtr![seq] = 0  // Unmask the new position
+
+        // kv_write_mask: clear previous, set current
+        if seq > 0 { kvWriteMaskPtr![seq - 1] = 0 }
+        kvWriteMaskPtr![seq] = Float16(1.0)
+
+        var inputDict: [String: MLFeatureValue] = [
+            "x": MLFeatureValue(multiArray: xArr),
+            "rope_cos": MLFeatureValue(multiArray: cosArr),
+            "rope_sin": MLFeatureValue(multiArray: sinArr),
+            "attn_mask": MLFeatureValue(multiArray: attnMaskArr!),
+            "kv_write_mask": MLFeatureValue(multiArray: kvWriteMaskArr!),
+        ]
+
+        // KV cache: fixed-size views — shapes NEVER change
+        for layer in 0..<cfg.nLayers {
+            inputDict[kCacheKeys[layer]] = MLFeatureValue(multiArray: fixedKViews![layer])
+            inputDict[vCacheKeys[layer]] = MLFeatureValue(multiArray: fixedVViews![layer])
+        }
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        let provider = try MLDictionaryFeatureProvider(dictionary: inputDict)
+        let result = try model.prediction(from: provider)
+        let t2 = CFAbsoluteTimeGetCurrent()
+
+        // Write new KV entries into pre-allocated buffer at position `seq`
+        for layer in 0..<cfg.nLayers {
+            let newK = result.featureValue(for: newKKeys[layer])!.multiArrayValue!
+            let newV = result.featureValue(for: newVKeys[layer])!.multiArrayValue!
+            let srcK = newK.dataPointer.assumingMemoryBound(to: Float16.self)
+            let srcV = newV.dataPointer.assumingMemoryBound(to: Float16.self)
+            for h in 0..<cfg.nKvHeads {
+                let dstOffset = h * maxSeq * cfg.dHead + seq * cfg.dHead
+                let srcOffset = h * cfg.dHead
+                memcpy(kCachePtr[layer] + dstOffset, srcK + srcOffset,
+                       cfg.dHead * MemoryLayout<Float16>.size)
+                memcpy(vCachePtr[layer] + dstOffset, srcV + srcOffset,
+                       cfg.dHead * MemoryLayout<Float16>.size)
+            }
+        }
+        cacheSeqLen += 1
+
+        let logits = result.featureValue(for: "logits")!.multiArrayValue!
+        let t3 = CFAbsoluteTimeGetCurrent()
+        tPack += t1 - t0
+        tPredict += t2 - t1
+        tExtract += t3 - t2
+        nForward += 1
+        return argmax(logits)
+    }
+
+    // ── Forward one token through ANE (flexible-shape) ──
+    func forwardOneFlex(tokenId: Int, pos: Int) throws -> Int {
         let t0 = CFAbsoluteTimeGetCurrent()
         let embedding = embd.lookup(tokenId)
 
-        // x: (1, d, 1, 1) — raw pointer fill (Dragon Book: strength reduction)
-        let xArr = try MLMultiArray(
-            shape: [1, NSNumber(value: cfg.dModel), 1, 1], dataType: .float16)
-        let xPtr = xArr.dataPointer.assumingMemoryBound(to: Float16.self)
+        // x: (1, d, 1, 1) — overwrite pre-allocated buffer
         for j in 0..<cfg.dModel {
             xPtr[j] = Float16(embedding[j])
         }
 
-        // RoPE — raw pointer fill
-        let cosArr = try MLMultiArray(shape: [1, NSNumber(value: dHalf)], dataType: .float16)
-        let sinArr = try MLMultiArray(shape: [1, NSNumber(value: dHalf)], dataType: .float16)
-        let cosPtr = cosArr.dataPointer.assumingMemoryBound(to: Float16.self)
-        let sinPtr = sinArr.dataPointer.assumingMemoryBound(to: Float16.self)
+        // RoPE — overwrite pre-allocated buffers
         let ropePos = min(pos, cfg.ropeCos.count - 1)
         for j in 0..<dHalf {
             cosPtr[j] = Float16(cfg.ropeCos[ropePos][j])
@@ -388,42 +633,39 @@ func main() throws {
             "rope_sin": MLFeatureValue(multiArray: sinArr),
         ]
 
-        // KV cache inputs: (1, nkv, seq, dh)
-        // Iverson: data is already in (nkv, seq, dh) layout — no transpose!
-        // Dragon Book: raw memcpy instead of NSNumber subscript
+        // KV cache: zero-copy strided views into pre-allocated buffers
+        // The cache is (nKvHeads, maxSeq, dHead) contiguous.
+        // We expose (1, nKvHeads, seqToUse, dHead) via strides that skip
+        // over unused maxSeq positions — no memcpy needed.
         let seq = cacheSeqLen
-        let seqToUse = max(seq, 1)  // First step: 1-length dummy (zeros)
+        let seqToUse = max(seq, 1)
         for layer in 0..<cfg.nLayers {
-            let kArr = try MLMultiArray(
+            let kView = try MLMultiArray(
+                dataPointer: UnsafeMutableRawPointer(kCachePtr[layer]),
                 shape: [1, NSNumber(value: cfg.nKvHeads), NSNumber(value: seqToUse), NSNumber(value: cfg.dHead)],
-                dataType: .float16)
-            let vArr = try MLMultiArray(
+                dataType: .float16,
+                strides: [
+                    NSNumber(value: cfg.nKvHeads * maxSeq * cfg.dHead),
+                    NSNumber(value: maxSeq * cfg.dHead),
+                    NSNumber(value: cfg.dHead),
+                    NSNumber(value: 1)
+                ],
+                deallocator: nil
+            )
+            let vView = try MLMultiArray(
+                dataPointer: UnsafeMutableRawPointer(vCachePtr[layer]),
                 shape: [1, NSNumber(value: cfg.nKvHeads), NSNumber(value: seqToUse), NSNumber(value: cfg.dHead)],
-                dataType: .float16)
-
-            if seq > 0 {
-                // Bulk copy: the cache is already in (nkv, seq, dh) layout
-                // Only copy the active portion (seq elements per head)
-                let kDst = kArr.dataPointer.assumingMemoryBound(to: Float16.self)
-                let vDst = vArr.dataPointer.assumingMemoryBound(to: Float16.self)
-                for h in 0..<cfg.nKvHeads {
-                    let srcOffset = h * maxSeq * cfg.dHead  // Source: (nkv, maxSeq, dh)
-                    let dstOffset = h * seq * cfg.dHead       // Dest: (nkv, seq, dh)
-                    let count = seq * cfg.dHead
-                    _ = kCacheData[layer].withUnsafeBufferPointer { buf in
-                        memcpy(kDst + dstOffset, buf.baseAddress! + srcOffset,
-                               count * MemoryLayout<Float16>.size)
-                    }
-                    _ = vCacheData[layer].withUnsafeBufferPointer { buf in
-                        memcpy(vDst + dstOffset, buf.baseAddress! + srcOffset,
-                               count * MemoryLayout<Float16>.size)
-                    }
-                }
-            }
-            // If seq == 0, arrays are already zero-initialized
-
-            inputDict["k_cache_\(layer)"] = MLFeatureValue(multiArray: kArr)
-            inputDict["v_cache_\(layer)"] = MLFeatureValue(multiArray: vArr)
+                dataType: .float16,
+                strides: [
+                    NSNumber(value: cfg.nKvHeads * maxSeq * cfg.dHead),
+                    NSNumber(value: maxSeq * cfg.dHead),
+                    NSNumber(value: cfg.dHead),
+                    NSNumber(value: 1)
+                ],
+                deallocator: nil
+            )
+            inputDict[kCacheKeys[layer]] = MLFeatureValue(multiArray: kView)
+            inputDict[vCacheKeys[layer]] = MLFeatureValue(multiArray: vView)
         }
 
         let t1 = CFAbsoluteTimeGetCurrent()
@@ -431,22 +673,22 @@ func main() throws {
         let result = try model.prediction(from: provider)
         let t2 = CFAbsoluteTimeGetCurrent()
 
-        // Append new KV entries to cache — Iverson: write in target layout directly
-        // Stepanov: cursor-based append into pre-allocated buffer
+        // Append new KV entries — write directly into pre-allocated buffers
+        // Stepanov: cursor-based append, no reallocation
         for layer in 0..<cfg.nLayers {
-            let newK = result.featureValue(for: "new_k_\(layer)")!.multiArrayValue!
-            let newV = result.featureValue(for: "new_v_\(layer)")!.multiArrayValue!
+            let newK = result.featureValue(for: newKKeys[layer])!.multiArrayValue!
+            let newV = result.featureValue(for: newVKeys[layer])!.multiArrayValue!
             let srcK = newK.dataPointer.assumingMemoryBound(to: Float16.self)
             let srcV = newV.dataPointer.assumingMemoryBound(to: Float16.self)
 
-            // new_k/new_v shape: (1, nkv, 1, dh) — write into (nkv, maxSeq, dh) at pos=seq
+            // new_k/new_v: (1, nkv, 1, dh) → write into (nkv, maxSeq, dh) at pos=seq
             for h in 0..<cfg.nKvHeads {
                 let dstOffset = h * maxSeq * cfg.dHead + seq * cfg.dHead
                 let srcOffset = h * cfg.dHead
-                for dd in 0..<cfg.dHead {
-                    kCacheData[layer][dstOffset + dd] = srcK[srcOffset + dd]
-                    vCacheData[layer][dstOffset + dd] = srcV[srcOffset + dd]
-                }
+                memcpy(kCachePtr[layer] + dstOffset, srcK + srcOffset,
+                       cfg.dHead * MemoryLayout<Float16>.size)
+                memcpy(vCachePtr[layer] + dstOffset, srcV + srcOffset,
+                       cfg.dHead * MemoryLayout<Float16>.size)
             }
         }
         cacheSeqLen += 1
@@ -461,9 +703,16 @@ func main() throws {
     }
 
     // ── Generation loop ──
-    print("\nGenerating (max \(maxTokens) tokens)...")
+    let modeStr = useStateful ? "STATEFUL (KV on-device, zero copy)" :
+                  (useFixed ? "FIXED shapes (no ANE replanning)" : "flexible shapes")
+    print("\nGenerating (max \(maxTokens) tokens, \(modeStr))...")
     print("─" + String(repeating: "─", count: 55))
     fflush(stdout)
+
+    // Dispatch: stateful > fixed > flex
+    let forward: (Int, Int) throws -> Int =
+        useStateful ? forwardOneStateful :
+        (useFixed ? forwardOneFixed : forwardOneFlex)
 
     var generated = [Int]()
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -471,7 +720,7 @@ func main() throws {
     // Prefill
     var lastToken = 0
     for (pos, tok) in tokens.enumerated() {
-        lastToken = try forwardOne(tokenId: tok, pos: pos)
+        lastToken = try forward(tok, pos)
     }
     generated.append(lastToken)
     // Stream first decoded token
@@ -487,7 +736,7 @@ func main() throws {
         let pos = tokens.count + step
         if pos >= cfg.maxSeqLen - 1 { break }
 
-        let next = try forwardOne(tokenId: generated.last!, pos: pos)
+        let next = try forward(generated.last!, pos)
         generated.append(next)
 
         // Stream decoded text
