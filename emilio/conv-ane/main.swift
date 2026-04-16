@@ -1,10 +1,10 @@
-// GOL-ANE: Conway's Game of Life on Apple Neural Engine
+// Conv-ANE: Conway's Game of Life on Apple Neural Engine
 //
 // Every generation is a 3×3 convolution + ReLU-based rule,
 // stacked N layers deep and pipelined through the ANE.
 //
-// Build: swiftc -O -framework CoreML -o gol_ane main.swift
-// Usage: ./gol_ane [n_generations] [--cpu-only]
+// Build: swiftc -O -framework CoreML -o conv_ane main.swift
+// Usage: ./conv_ane [n_generations] [--cpu-only]
 
 import CoreML
 import Foundation
@@ -273,7 +273,7 @@ func main() throws {
     print("""
 
     ╔════════════════════════════════════════════════╗
-    ║          GOL-ANE  ·  Results                   ║
+    ║          Conv-ANE  ·  Results                  ║
     ╚════════════════════════════════════════════════╝
 
       Grid:            \(H)×\(W) (\(H * W) cells)

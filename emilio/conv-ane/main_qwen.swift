@@ -1,4 +1,4 @@
-// GOL-ANE Qwen: Conv-only transformer inference on Apple Neural Engine.
+// Conv-ANE Qwen: Conv-only transformer inference on Apple Neural Engine.
 //
 // Every linear projection is a Conv2d(1×1). The ANE's convolution engine
 // computes all matmuls. The host manages the KV cache and autoregressive loop.
@@ -348,7 +348,7 @@ func main() throws {
     print("""
 
     ╔════════════════════════════════════════════════════════╗
-    ║  GOL-ANE Qwen  ·  Conv-Only Inference                 ║
+    ║  Conv-ANE Qwen  ·  Conv-Only Inference                ║
     ╚════════════════════════════════════════════════════════╝
 
       Model:           Qwen2.5-0.5B (\(cfg.nLayers) layer\(cfg.nLayers > 1 ? "s" : ""))

@@ -752,9 +752,9 @@ Verification against CPU reference passes with zero mismatches.
 \textbf{Engine} & \textbf{Backend} & \textbf{Prefill} & \textbf{Decode} \\
 \midrule
 llama.cpp & Metal GPU & 5,978 t/s & 332 t/s \\
-GOL-ANE (flex) & ANE (conv) & 83 t/s & 85 t/s \\
-GOL-ANE (fixed) & ANE (conv) & 115 t/s & 80 t/s \\
-GOL-ANE (stateful) & ANE (conv) & 170 t/s & 171 t/s \\
+Conv-ANE (flex) & ANE (conv) & 83 t/s & 85 t/s \\
+Conv-ANE (fixed) & ANE (conv) & 115 t/s & 80 t/s \\
+Conv-ANE (stateful) & ANE (conv) & 170 t/s & 171 t/s \\
 \bottomrule
 \end{tabular}
 \caption{Qwen2.5-0.5B-Instruct (Q8\_0) on Apple M4 Max. Stateful mode
@@ -763,7 +763,7 @@ GPU---on a compute unit that llama.cpp does not use.}
 \label{tab:transformer}
 \end{table}
 
-The GOL-ANE stateful configuration reaches 171~tok/s decode, within
+The Conv-ANE stateful configuration reaches 171~tok/s decode, within
 2$\times$ of llama.cpp on Metal GPU, while operating on an entirely
 different compute unit. The ANE path leaves the GPU free for other
 tasks (rendering, other models). Fixed-shape mode wins on prefill

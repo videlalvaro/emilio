@@ -1,5 +1,5 @@
 #!/bin/bash
-# Energy benchmark for GOL-ANE (qwen_ane) vs llama.cpp
+# Energy benchmark for Conv-ANE (qwen_ane) vs llama.cpp
 #
 # Measures power consumption via powermetrics while running sustained
 # inference workloads. Requires sudo for powermetrics.
@@ -23,7 +23,7 @@ LLAMA_BENCH="$REPO_DIR/../llama.cpp/build/bin/llama-bench"
 MODEL_GGUF="$REPO_DIR/models/qwen2.5-0.5b-instruct-q8_0.gguf"
 
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Energy Benchmark: GOL-ANE vs llama.cpp             ║"
+echo "║   Energy Benchmark: Conv-ANE vs llama.cpp            ║"
 echo "║   Duration: ${DURATION}s per engine                          ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -155,9 +155,9 @@ echo ""
 echo "  Idle baseline: CPU=${IDLE_CPU}mW GPU=${IDLE_GPU}mW ANE=${IDLE_ANE}mW Combined=${IDLE_COMBINED}mW"
 echo ""
 
-# ─── Phase 1: GOL-ANE ──────────────────────────────────────────────
+# ─── Phase 1: Conv-ANE ─────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════"
-echo "Phase 1: GOL-ANE (qwen_ane on ANE) — ${DURATION}s"
+echo "Phase 1: Conv-ANE (qwen_ane on ANE) — ${DURATION}s"
 echo "════════════════════════════════════════════════════════"
 
 # Cool-down between tests
@@ -165,7 +165,7 @@ sleep 5
 
 # qwen_ane uses relative paths — must run from its directory
 pushd "$SCRIPT_DIR" > /dev/null
-run_bench "gol_ane" \
+run_bench "conv_ane" \
     "$QWEN_ANE" --prompt "Explain the theory of computation, starting from Turing machines, through lambda calculus, to modern type theory. Cover the Church-Turing thesis, decidability, complexity classes P and NP, and their implications for practical computing." --max-tokens 512
 popd > /dev/null
 

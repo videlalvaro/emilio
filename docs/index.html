@@ -365,7 +365,7 @@ alive&prime; = clamp(eq(s, 3) + eq(s, 11) + eq(s, 12), 0, 1)
 </p>
 
 <figure class="gif-container">
-  <img src="emilio/gol-ane/gifs/gol_evolution.gif" alt="Gosper glider gun evolving on a 64×80 grid">
+  <img src="emilio/conv-ane/gifs/gol_evolution.gif" alt="Gosper glider gun evolving on a 64×80 grid">
   <figcaption>Gosper glider gun evolving via Conv2d(3&times;3) + ReLU rule evaluation. Each frame is one ANE forward pass. 2.3 billion cell-generations per second on a 1024&times;1024 grid.</figcaption>
 </figure>
 
@@ -413,7 +413,7 @@ y<sub>i</sub> = &sum;<sub>j</sub> W<sub>ij</sub> &middot; x<sub>j</sub>
 </p>
 
 <figure class="gif-container">
-  <img src="emilio/gol-ane/gifs/token_generation.gif" alt="Token-by-token generation on ANE at 171 tok/s">
+  <img src="emilio/conv-ane/gifs/token_generation.gif" alt="Token-by-token generation on ANE at 171 tok/s">
   <figcaption>Token-by-token generation. Each token flows through 24 layers of Conv2d(1&times;1) on the ANE. Real output from Qwen 2.5-0.5B with stateful KV caching at 5.67ms/token.</figcaption>
 </figure>
 
@@ -457,7 +457,7 @@ y<sub>i</sub> = &sum;<sub>j</sub> W<sub>ij</sub> &middot; x<sub>j</sub>
 </div>
 
 <figure class="gif-container">
-  <img src="emilio/gol-ane/gifs/dataflow.gif" alt="Data flow through 24 transformer layers">
+  <img src="emilio/conv-ane/gifs/dataflow.gif" alt="Data flow through 24 transformer layers">
   <figcaption>One token flowing through 24 layers &times; 7 operations = 168 convolutions + LM head. Each cell is one Conv2d(1&times;1) dispatch. Total: 5.67ms.</figcaption>
 </figure>
 
@@ -471,7 +471,7 @@ y<sub>i</sub> = &sum;<sub>j</sub> W<sub>ij</sub> &middot; x<sub>j</sub>
 </p>
 
 <figure class="gif-container">
-  <img src="emilio/gol-ane/gifs/split_screen.gif" alt="GOL and transformer running on the same ANE convolution engine">
+  <img src="emilio/conv-ane/gifs/split_screen.gif" alt="GOL and transformer running on the same ANE convolution engine">
   <figcaption>Left: Game of Life evolving via 3&times;3 convolution. Right: transformer generating text via 1&times;1 convolution. Center: the ANE&rsquo;s 16-core engine running both.</figcaption>
 </figure>
 

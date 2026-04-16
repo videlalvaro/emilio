@@ -1,5 +1,5 @@
 #!/bin/bash
-# GOL-ANE: Build and run Game of Life on Apple Neural Engine
+# Conv-ANE: Build and run Game of Life on Apple Neural Engine
 #
 # Usage: ./build.sh [grid_size] [n_generations]
 #   grid_size:     side length of square grid (default: 64)
@@ -12,7 +12,7 @@ GRID=${1:-64}
 GENS=${2:-32}
 
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   GOL-ANE: Game of Life on Apple Neural Engine       ║"
+echo "║   Conv-ANE: Convolution on Apple Neural Engine       ║"
 echo "║   Grid: ${GRID}×${GRID}  ·  Generations: ${GENS}                  ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -40,11 +40,11 @@ echo "    ✓ GOL.mlmodelc ready"
 # Step 3: Compile Swift host
 echo ""
 echo "==> Step 3: Compiling Swift host..."
-swiftc -O -framework CoreML -o gol_ane main.swift
-echo "    ✓ gol_ane binary ready"
+swiftc -O -framework CoreML -o conv_ane main.swift
+echo "    ✓ conv_ane binary ready"
 
 # Step 4: Run
 echo ""
 echo "==> Step 4: Running..."
 echo "════════════════════════════════════════════════════════"
-./gol_ane "$GENS"
+./conv_ane "$GENS"
