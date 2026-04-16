@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en" data-color-mode="dark" data-dark-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>One Primitive: Convolution on Apple's Neural Engine</title>
+  <style>
+    :root {
+      --color-canvas-default: #0d1117;
+      --color-canvas-subtle: #161b22;
+      --color-border-default: #30363d;
+      --color-border-muted: #21262d;
+      --color-fg-default: #e6edf3;
+      --color-fg-muted: #7d8590;
+      --color-fg-subtle: #6e7681;
+      --color-accent-fg: #58a6ff;
+      --color-success-fg: #3fb950;
+      --color-attention-fg: #d29922;
+      --color-danger-fg: #f85149;
+      --color-done-fg: #a371f7;
+      --color-canvas-inset: #010409;
+      --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-canvas-default);
+      color: var(--color-fg-default);
+      line-height: 1.6;
+      font-size: 16px;
+    }
+
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    /* ── Header ── */
+    header {
+      border-bottom: 1px solid var(--color-border-default);
+      padding-bottom: 24px;
+      margin-bottom: 32px;
+    }
+
+    header h1 {
+      font-size: 32px;
+      font-weight: 600;
+      line-height: 1.25;
+      margin-bottom: 8px;
+    }
+
+    header .subtitle {
+      color: var(--color-fg-muted);
+      font-size: 16px;
+    }
+
+    header .meta {
+      margin-top: 12px;
+      color: var(--color-fg-subtle);
+      font-size: 14px;
+    }
+
+    header .meta a {
+      color: var(--color-accent-fg);
+      text-decoration: none;
+    }
+
+    header .meta a:hover {
+      text-decoration: underline;
+    }
+
+    /* ── Sections ── */
+    h2 {
+      font-size: 24px;
+      font-weight: 600;
+      margin-top: 40px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--color-border-muted);
+    }
+
+    h3 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 28px;
+      margin-bottom: 12px;
+    }
+
+    p {
+      margin-bottom: 16px;
+    }
+
+    /* ── Code ── */
+    code {
+      font-family: var(--font-mono);
+      font-size: 85%;
+      background: var(--color-canvas-subtle);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    pre {
+      background: var(--color-canvas-subtle);
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      padding: 16px;
+      overflow-x: auto;
+      margin-bottom: 16px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    /* ── Images / GIFs ── */
+    .gif-container {
+      margin: 24px 0;
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--color-canvas-inset);
+    }
+
+    .gif-container img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .gif-container figcaption {
+      padding: 10px 16px;
+      font-size: 13px;
+      color: var(--color-fg-muted);
+      border-top: 1px solid var(--color-border-muted);
+    }
+
+    /* ── Key figure ── */
+    .key-figure {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin: 24px 0;
+      padding: 20px;
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      background: var(--color-canvas-subtle);
+    }
+
+    .key-figure .number {
+      font-size: 48px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--color-success-fg);
+      white-space: nowrap;
+    }
+
+    .key-figure .label {
+      color: var(--color-fg-muted);
+      font-size: 15px;
+    }
+
+    /* ── Table ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 8px 12px;
+      border: 1px solid var(--color-border-default);
+    }
+
+    th {
+      background: var(--color-canvas-subtle);
+      font-weight: 600;
+      color: var(--color-fg-muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    td code {
+      font-size: 12px;
+    }
+
+    /* ── Equation blocks ── */
+    .equation {
+      margin: 20px 0;
+      padding: 16px 20px;
+      background: var(--color-canvas-subtle);
+      border-left: 3px solid var(--color-accent-fg);
+      border-radius: 0 6px 6px 0;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      overflow-x: auto;
+    }
+
+    /* ── Lists ── */
+    ul, ol {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+
+    li {
+      margin-bottom: 6px;
+    }
+
+    /* ── Emphasis ── */
+    strong {
+      font-weight: 600;
+    }
+
+    em {
+      font-style: italic;
+    }
+
+    .highlight {
+      color: var(--color-attention-fg);
+    }
+
+    .success {
+      color: var(--color-success-fg);
+    }
+
+    /* ── Aside / Note ── */
+    .note {
+      margin: 20px 0;
+      padding: 12px 16px;
+      border: 1px solid var(--color-border-default);
+      border-left: 3px solid var(--color-accent-fg);
+      border-radius: 0 6px 6px 0;
+      background: var(--color-canvas-subtle);
+      font-size: 14px;
+      color: var(--color-fg-muted);
+    }
+
+    .note strong {
+      color: var(--color-fg-default);
+    }
+
+    /* ── Footer ── */
+    footer {
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid var(--color-border-default);
+      color: var(--color-fg-subtle);
+      font-size: 13px;
+    }
+
+    footer a {
+      color: var(--color-accent-fg);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      .key-figure {
+        flex-direction: column;
+        text-align: center;
+      }
+      header h1 { font-size: 24px; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>One Primitive: Running a Transformer and Game of Life on Apple&rsquo;s Neural Engine via Convolution</h1>
+  <p class="subtitle">
+    Both Conway&rsquo;s Game of Life and Qwen&nbsp;2.5&#8209;0.5B compile to the same instruction: convolution on the ANE&rsquo;s 16&#8209;core engine.
+  </p>
+  <p class="meta">Alvaro Videla &middot; April 2026 &middot; <a href="https://github.com/videlalvaro/emilio">Source code</a></p>
+</header>
+
+<!-- ════════════ Key result ════════════ -->
+
+<div class="key-figure">
+  <span class="number">171&nbsp;tok/s</span>
+  <span class="label">
+    Decode throughput on Apple&nbsp;M4&nbsp;Max &mdash; Qwen&nbsp;2.5&#8209;0.5B running <em>entirely</em> on the Neural Engine via <code>Conv2d(1&times;1)</code>.
+    <br>19&times; improvement from initial implementation (9&nbsp;tok/s) through four targeted optimizations.
+  </span>
+</div>
+
+<!-- ════════════ Intro ════════════ -->
+
+<h2>The Idea</h2>
+
+<p>
+  Apple&rsquo;s Neural Engine is a hardware convolution accelerator present in every Apple&nbsp;Silicon chip.
+  Unlike the GPU&mdash;which runs arbitrary parallel kernels&mdash;the ANE achieves peak throughput on a narrow set of operations: small-kernel convolutions, element-wise arithmetic, and activation functions.
+</p>
+
+<p>
+  This project demonstrates that <strong>convolution alone</strong> is a sufficient primitive to implement two seemingly different computations on the same silicon:
+</p>
+
+<ol>
+  <li><strong>Conway&rsquo;s Game of Life</strong> &mdash; a cellular automaton where each generation is a <code>Conv2d(3&times;3)</code> counting neighbors, followed by ReLU-based rule evaluation.</li>
+  <li><strong>Transformer inference</strong> &mdash; a full Qwen&nbsp;2.5&#8209;0.5B language model where every matrix multiplication is a <code>Conv2d(1&times;1)</code> operation.</li>
+</ol>
+
+<p>
+  The connection is not metaphorical. Both computations compile to the same ANE instruction stream: convolution kernels dispatched to the same 16-core engine.
+</p>
+
+<!-- ════════════ GOL ════════════ -->
+
+<h2>Game of Life as Convolution</h2>
+
+<p>
+  Conway&rsquo;s Game of Life operates on a binary grid. The rules depend on alive-neighbor count: birth (exactly&nbsp;3), survival (2&nbsp;or&nbsp;3), death (otherwise).
+  We encode one generation as a single convolution with a carefully chosen kernel:
+</p>
+
+<div class="equation">
+K = [[1, 1, 1],<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[1, <span class="highlight">9</span>, 1],<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[1, 1, 1]]
+</div>
+
+<p>
+  The center weight&nbsp;<code>9</code> encodes the cell&rsquo;s own state into the output, separating dead cells (sum&nbsp;0&ndash;8) from alive cells (sum&nbsp;9&ndash;17) into non-overlapping integer ranges. This enables branchless rule evaluation via ReLU:
+</p>
+
+<div class="equation">
+eq(s, k) = relu(1 &minus; (relu(s &minus; k) + relu(k &minus; s)))<br><br>
+alive&prime; = clamp(eq(s, 3) + eq(s, 11) + eq(s, 12), 0, 1)
+</div>
+
+<p>
+  Where <code>s=3</code> is birth, <code>s=11</code> is survival with 2 neighbors, and <code>s=12</code> is survival with 3. The entire generation is one conv + a few ReLU ops &mdash; natively accelerated on the ANE.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane/gifs/gol_evolution.gif" alt="Gosper glider gun evolving on a 64×80 grid">
+  <figcaption>Gosper glider gun evolving via Conv2d(3&times;3) + ReLU rule evaluation. Each frame is one ANE forward pass. 2.3 billion cell-generations per second on a 1024&times;1024 grid.</figcaption>
+</figure>
+
+<!-- ════════════ Transformer ════════════ -->
+
+<h2>Transformer as Convolution</h2>
+
+<p>
+  A transformer processes one token at a time through a stack of identical layers. Each layer performs five steps: normalize (RMSNorm), project to Q/K/V, attend, project output, and feed-forward network. After 24 layers, a final projection maps the 896-dimensional vector to 151,936 vocabulary logits.
+</p>
+
+<p>
+  The key observation: <strong>all the expensive operations are matrix&ndash;vector products</strong> <em>y&nbsp;=&nbsp;Wx</em>. The nonlinearities (SiLU, softmax, RMSNorm) are element-wise and cheap.
+</p>
+
+<h3>Why <code>Conv2d(1&times;1)</code> = Matrix Multiply</h3>
+
+<p>
+  When spatial dimensions are 1&times;1, a convolution degenerates to a weighted sum across input channels, repeated for each output channel. That is exactly matrix&ndash;vector multiplication:
+</p>
+
+<div class="equation">
+y<sub>i</sub> = &sum;<sub>j</sub> W<sub>ij</sub> &middot; x<sub>j</sub>
+</div>
+
+<p>
+  We reshape the transformer&rsquo;s hidden state from shape <code>(896,)</code> to <code>(1, 896, 1, 1)</code> &mdash; 896&nbsp;&ldquo;channels&rdquo; of a single 1&times;1 &ldquo;image&rdquo;. A <code>Conv2d(896, 1152, kernel_size=1)</code> then produces the QKV projection. No approximation &mdash; the operations are mathematically identical.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Matrix Shape</th><th>Conv2d</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>QKV projection</td><td>896 &rarr; 1152</td><td><code>Conv(896, 1152, 1)</code></td></tr>
+    <tr><td>Output projection</td><td>896 &rarr; 896</td><td><code>Conv(896, 896, 1)</code></td></tr>
+    <tr><td>Gate + Up</td><td>896 &rarr; 9728</td><td><code>Conv(896, 9728, 1)</code></td></tr>
+    <tr><td>Down projection</td><td>4864 &rarr; 896</td><td><code>Conv(4864, 896, 1)</code></td></tr>
+    <tr><td>LM head</td><td>896 &rarr; 151936</td><td><code>Conv(896, 151936, 1)</code></td></tr>
+  </tbody>
+</table>
+
+<p>
+  169 matrix multiplications per token (7 per layer &times; 24 layers + LM head), all dispatched to the ANE&rsquo;s convolution engine.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane/gifs/token_generation.gif" alt="Token-by-token generation on ANE at 171 tok/s">
+  <figcaption>Token-by-token generation. Each token flows through 24 layers of Conv2d(1&times;1) on the ANE. Real output from Qwen 2.5-0.5B with stateful KV caching at 5.67ms/token.</figcaption>
+</figure>
+
+<!-- ════════════ Optimizations ════════════ -->
+
+<h2>Optimization Journey: 9 &rarr; 171 tok/s</h2>
+
+<p>
+  The initial conv-only implementation produced coherent output at 9&nbsp;tok/s. Four targeted optimizations delivered a 19&times; improvement:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Step</th><th>What Changed</th><th>tok/s</th><th>Speedup</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Baseline</td><td>Conv-only model, na&iuml;ve host code</td><td>9</td><td>1&times;</td></tr>
+    <tr>
+      <td>Book-driven fixes</td>
+      <td>
+        Eliminated per-token allocations, fused KV scatter,<br>
+        batched GQA (672 &rarr; 96 attention matmuls)
+      </td>
+      <td>90</td><td>10&times;</td></tr>
+    <tr><td>Pre-allocated buffers</td><td>Reuse MLMultiArray across tokens (pack 0.4%, ANE 99.5%)</td><td>90</td><td>&mdash;</td></tr>
+    <tr><td>Fixed-shape model</td><td>Compile with static shapes, skip dynamic padding</td><td>78</td><td>&mdash;</td></tr>
+    <tr>
+      <td>Stateful KV cache</td>
+      <td>
+        CoreML <code>MLState</code> &mdash; KV cache lives on ANE,<br>
+        zero host-side copy (macOS 15+)
+      </td>
+      <td class="success"><strong>171</strong></td>
+      <td class="success"><strong>19&times;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>Why stateful KV matters:</strong> In the flex-mode loop, 23% of time was spent packing KV tensors into MLMultiArray and another ~40% waiting for the ANE to read them. CoreML&rsquo;s <code>MLState</code> API (macOS&nbsp;15) keeps the KV cache on-device: the model writes to it in-place via registered state buffers. Pack time dropped from 23% to 0.00ms.
+</div>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane/gifs/dataflow.gif" alt="Data flow through 24 transformer layers">
+  <figcaption>One token flowing through 24 layers &times; 7 operations = 168 convolutions + LM head. Each cell is one Conv2d(1&times;1) dispatch. Total: 5.67ms.</figcaption>
+</figure>
+
+<!-- ════════════ The Punchline ════════════ -->
+
+<h2>The Punchline</h2>
+
+<p>
+  The Game of Life uses <code>Conv2d(3&times;3)</code>. The transformer uses <code>Conv2d(1&times;1)</code>.
+  Both run on the same 16-core convolution engine. Same silicon, same primitive, two completely different computations.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane/gifs/split_screen.gif" alt="GOL and transformer running on the same ANE convolution engine">
+  <figcaption>Left: Game of Life evolving via 3&times;3 convolution. Right: transformer generating text via 1&times;1 convolution. Center: the ANE&rsquo;s 16-core engine running both.</figcaption>
+</figure>
+
+<div class="key-figure">
+  <span class="number">5.67ms</span>
+  <span class="label">
+    Per-token latency. Within 2&times; of the DRAM bandwidth floor (4.7ms theoretical for 472&nbsp;MB int8 weights at 100&nbsp;GB/s).
+    <br>The remaining gap is scheduling overhead and element-wise ops between convolutions.
+  </span>
+</div>
+
+<!-- ════════════ Technical Details ════════════ -->
+
+<h2>Technical Details</h2>
+
+<h3>Model</h3>
+<ul>
+  <li>Qwen 2.5-0.5B-Instruct &mdash; 24 layers, <em>d</em>=896, 14 query heads, 2 KV heads</li>
+  <li>Int8 block-wise quantization (block size 32) &mdash; 472 MB</li>
+  <li>Grouped Query Attention batched to 96 matmuls (down from 672)</li>
+</ul>
+
+<h3>Stack</h3>
+<ul>
+  <li>Model conversion: Python + <code>coremltools</code> 9.0 &rarr; CoreML <code>.mlpackage</code></li>
+  <li>Inference: Swift + CoreML + <code>MLState</code> (macOS 15+)</li>
+  <li>Hardware: Apple M4 Max</li>
+</ul>
+
+<h3>What Runs Where</h3>
+<ul>
+  <li><strong>ANE convolution engine (16 cores):</strong> All 169 matrix multiplications per token</li>
+  <li><strong>ANE element-wise ALUs:</strong> RMSNorm, RoPE, softmax, SiLU</li>
+  <li><strong>CPU:</strong> Tokenization, argmax, embedding lookup</li>
+</ul>
+
+<!-- ════════════ Footer ════════════ -->
+
+<footer>
+  <p>
+    <a href="https://github.com/videlalvaro/emilio">GitHub repository</a> &middot;
+    Source code includes the GGUF-to-CoreML converter, Swift inference engine, and GOL encoder.
+  </p>
+</footer>
+
+</div>
+</body>
+</html>
