@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en" data-color-mode="dark" data-dark-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A 2-Tag System as the Control Model for Transformer Inference</title>
+
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="A 2-Tag System as the Control Model for Transformer Inference">
+  <meta property="og:description" content="A two-symbol word controls transformer inference: one production rule per sub-operation, 16 steps for the tiny model, 315 for Qwen 2.5-0.5B.">
+  <meta property="og:url" content="https://videlalvaro.github.io/emilio/tag-system.html">
+  <meta property="og:image" content="https://videlalvaro.github.io/emilio/og-card.png">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="A 2-Tag System as the Control Model for Transformer Inference">
+  <meta name="twitter:description" content="One token, one two-symbol word, 315 production rules. How the tag controller actually works.">
+  <meta name="twitter:image" content="https://videlalvaro.github.io/emilio/og-card.png">
+
+  <style>
+    :root {
+      --color-canvas-default: #0d1117;
+      --color-canvas-subtle: #161b22;
+      --color-border-default: #30363d;
+      --color-border-muted: #21262d;
+      --color-fg-default: #e6edf3;
+      --color-fg-muted: #7d8590;
+      --color-fg-subtle: #6e7681;
+      --color-accent-fg: #58a6ff;
+      --color-success-fg: #3fb950;
+      --color-attention-fg: #d29922;
+      --color-danger-fg: #f85149;
+      --color-done-fg: #a371f7;
+      --color-canvas-inset: #010409;
+      --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-canvas-default);
+      color: var(--color-fg-default);
+      line-height: 1.6;
+      font-size: 16px;
+    }
+
+    .container {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--color-border-default);
+      padding-bottom: 24px;
+      margin-bottom: 32px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      margin-bottom: 14px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(88, 166, 255, 0.12);
+      color: var(--color-accent-fg);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    header h1 {
+      font-size: 34px;
+      font-weight: 600;
+      line-height: 1.2;
+      margin-bottom: 10px;
+    }
+
+    header .subtitle {
+      color: var(--color-fg-muted);
+      font-size: 17px;
+      max-width: 760px;
+    }
+
+    header .meta {
+      margin-top: 14px;
+      color: var(--color-fg-subtle);
+      font-size: 14px;
+    }
+
+    a {
+      color: var(--color-accent-fg);
+      text-decoration: none;
+    }
+
+    a:hover { text-decoration: underline; }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 28px 0 34px;
+    }
+
+    .metric-card {
+      border: 1px solid var(--color-border-default);
+      border-radius: 10px;
+      padding: 18px 20px;
+      background: linear-gradient(180deg, rgba(22, 27, 34, 1) 0%, rgba(13, 17, 23, 1) 100%);
+    }
+
+    .metric-card .number {
+      display: block;
+      margin-bottom: 6px;
+      font-family: var(--font-mono);
+      font-size: 34px;
+      font-weight: 700;
+      color: var(--color-success-fg);
+    }
+
+    .metric-card .label {
+      color: var(--color-fg-muted);
+      font-size: 14px;
+    }
+
+    h2 {
+      font-size: 24px;
+      font-weight: 600;
+      margin-top: 42px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--color-border-muted);
+    }
+
+    h3 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 28px;
+      margin-bottom: 12px;
+    }
+
+    p { margin-bottom: 16px; }
+
+    ul, ol {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+
+    li { margin-bottom: 6px; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 85%;
+      background: var(--color-canvas-subtle);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    pre {
+      background: var(--color-canvas-subtle);
+      border: 1px solid var(--color-border-default);
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      margin-bottom: 16px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    .equation {
+      margin: 20px 0;
+      padding: 16px 20px;
+      background: var(--color-canvas-subtle);
+      border-left: 3px solid var(--color-accent-fg);
+      border-radius: 0 8px 8px 0;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      overflow-x: auto;
+    }
+
+    .viz-container {
+      margin: 24px 0;
+      border: 1px solid var(--color-border-default);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--color-canvas-inset);
+    }
+
+    .viz-container img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .viz-container figcaption {
+      padding: 12px 16px;
+      font-size: 13px;
+      color: var(--color-fg-muted);
+      border-top: 1px solid var(--color-border-muted);
+      background: var(--color-canvas-subtle);
+    }
+
+    .note {
+      margin: 20px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--color-border-default);
+      border-left: 3px solid var(--color-attention-fg);
+      border-radius: 0 8px 8px 0;
+      background: var(--color-canvas-subtle);
+      font-size: 14px;
+      color: var(--color-fg-muted);
+    }
+
+    .trace-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 20px 0 24px;
+    }
+
+    .trace-card {
+      padding: 16px;
+      border: 1px solid var(--color-border-default);
+      border-radius: 8px;
+      background: var(--color-canvas-subtle);
+    }
+
+    .trace-card h3 {
+      margin-top: 0;
+    }
+
+    .trace-card p:last-child {
+      margin-bottom: 0;
+    }
+
+    footer {
+      margin-top: 52px;
+      padding-top: 24px;
+      border-top: 1px solid var(--color-border-default);
+      color: var(--color-fg-subtle);
+      font-size: 13px;
+    }
+
+    @media (max-width: 700px) {
+      .hero-grid,
+      .trace-grid {
+        grid-template-columns: 1fr;
+      }
+
+      header h1 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <span class="eyebrow">Related Post</span>
+  <h1>A 2-Tag System as the Control Model for Transformer Inference</h1>
+  <p class="subtitle">
+    The matmuls and nonlinearities do the math, but a two-symbol word decides what runs next.
+    One production rule per sub-operation, 16 steps for the tiny model, 315 for Qwen&nbsp;2.5-0.5B.
+  </p>
+  <p class="meta">
+    Alvaro Videla &middot; April 2026 &middot;
+    <a href="index.html">Main post</a> &middot;
+    <a href="https://github.com/videlalvaro/emilio/tree/main/emilio/tag">Tag-system source</a>
+  </p>
+</header>
+
+<div class="hero-grid">
+  <div class="metric-card">
+    <span class="number">|word| = 2</span>
+    <span class="label">
+      The machine state is always a two-symbol word: <code>[OP, STATE]</code>. Each production replaces it with one new pair.
+    </span>
+  </div>
+  <div class="metric-card">
+    <span class="number">13L + 3</span>
+    <span class="label">
+      Step count per token. For Qwen&nbsp;2.5-0.5B with 24 layers that means exactly <strong>315 production rules</strong>.
+    </span>
+  </div>
+</div>
+
+<h2>The Strange Claim</h2>
+
+<p>
+  A classic 2-tag system reads the leftmost symbol, appends a production, and deletes two symbols.
+  In the implementation here, the transformer controller still follows that shape, but every production emits exactly one new pair:
+  a next operation symbol and a mutated state carrier.
+</p>
+
+<div class="equation">
+[OP<sub>l</sub>, STATE(s)] &rarr; [OP'<sub>l'</sub>, STATE(f<sub>OP</sub>(s))]
+</div>
+
+<p>
+  That fixed-length form is the whole trick. The word never grows, so the controller is easy to execute, inspect, and profile. The heavy work still happens inside the production rule itself: RMSNorm, attention, feed-forward matmuls, and the LM head.
+</p>
+
+<figure class="viz-container">
+  <img src="emilio/tag-system/tag-rewrite.svg" alt="One tag production rewriting a two-symbol word from QKV_MATMUL to BIAS_ADD while preserving word length two">
+  <figcaption>
+    One production rule in the actual engine. Read the head op, execute its neural sub-operation, and emit the next <code>[OP, STATE]</code> pair. This is the fixed-length equivalent of append-then-delete with deletion number 2.
+  </figcaption>
+</figure>
+
+<h2>One Operation, Written as a Trace</h2>
+
+<p>
+  Take the fused QKV projection in layer <code>l</code>. In symbolic form, one production rule looks like this:
+</p>
+
+<pre><code>before: [QKV_MATMUL_l, STATE(x = x_norm, layer = l)]
+rule:   qkv = x_norm @ W_qkv^(l)
+after:  [BIAS_ADD_l, STATE(x = qkv, layer = l)]</code></pre>
+
+<p>
+  The implementation in <code>eml_tag.c</code> literally follows that structure: <code>produce_qkv_matmul()</code> computes the projection and sets the next op to <code>TAG_BIAS_ADD</code>.
+</p>
+
+<div class="trace-grid">
+  <div class="trace-card">
+    <h3>Control Side</h3>
+    <p>
+      Read the current operation symbol, dispatch the matching production rule, then replace the current head with the next operation symbol.
+    </p>
+  </div>
+  <div class="trace-card">
+    <h3>Evaluation Side</h3>
+    <p>
+      Inside that rule, the state is mutated in place. Matmuls may call optimized kernels, but the tag system decides the order, not the hardware backend.
+    </p>
+  </div>
+</div>
+
+<h2>One Token Through the Tiny Model</h2>
+
+<p>
+  The one-layer tiny model is the clearest visualization because it completes in 16 steps. The first 14 are the layer pipeline, then the controller falls through to <code>FINAL_NORM</code> and <code>LM_HEAD</code>, and the next head symbol becomes <code>HALT</code>.
+</p>
+
+<figure class="viz-container">
+  <img src="emilio/tag-system/tag-token-trace.svg" alt="Animated SVG showing the 16-step tiny-model token trace through embed, attention, feed-forward, final norm, and lm head">
+  <figcaption>
+    The tiny-model trace. The real 24-layer Qwen run keeps the same pattern, but repeats the 13 layer-local operations for each layer before final normalization and the LM head.
+  </figcaption>
+</figure>
+
+<ol>
+  <li><strong>EMBED</strong> loads the token embedding and points the controller at <code>RMSNORM_ATTN_0</code>.</li>
+  <li><strong>Attention pipeline</strong> runs as <code>RMSNORM_ATTN &rarr; QKV_MATMUL &rarr; BIAS_ADD &rarr; ROPE &rarr; KV_STORE &rarr; ATTENTION &rarr; OUT_PROJ &rarr; RESIDUAL_ATTN</code>.</li>
+  <li><strong>FFN pipeline</strong> runs as <code>FFN_NORM &rarr; GATE_UP &rarr; SILU_MUL &rarr; DOWN_PROJ &rarr; RESIDUAL_FFN</code>.</li>
+  <li><strong>Layer rollover</strong> happens at <code>RESIDUAL_FFN</code>: either jump to the next layer&rsquo;s <code>RMSNORM_ATTN</code> or, on the last layer, jump to <code>FINAL_NORM</code>.</li>
+  <li><strong>LM_HEAD</strong> computes logits, stores the argmax, and emits <code>HALT</code>.</li>
+</ol>
+
+<h2>Why Qwen Takes 315 Steps</h2>
+
+<p>
+  The controller executes exactly one embedding step, 13 layer-local steps per transformer layer, then two terminal steps:
+</p>
+
+<div class="equation">
+1 + L &times; 13 + 1 + 1 = 13L + 3<br>
+For L = 24: 1 + 24 &times; 13 + 2 = 315
+</div>
+
+<p>
+  What repeats is not the whole graph, only the operation word. The same production rule shapes recur with different layer indices and different weight tensors.
+</p>
+
+<div class="note">
+  <strong>Control model vs evaluation model:</strong> the tag system answers <em>what happens next</em>. The optimized kernels answer <em>how this particular rule is evaluated</em>. That separation is why the same controller can remain a clean Post-style machine while the underlying math runs through fast specialized code.
+</div>
+
+<h2>What the STATE Symbol Actually Carries</h2>
+
+<p>
+  The state carrier is not just a placeholder. It holds the mutable payload needed to continue the token pass:
+</p>
+
+<ul>
+  <li>the current activation vector <code>x</code></li>
+  <li>the saved residual vector when a residual path is open</li>
+  <li>the current token id and sequence position</li>
+  <li>the current layer index</li>
+</ul>
+
+<p>
+  KV cache updates happen as side effects of rules like <code>KV_STORE</code>, but the controller still only needs the same two-symbol word to decide the next step.
+</p>
+
+<h2>Why SVG Fits Better Than GIF Here</h2>
+
+<p>
+  For this controller, SVG is the right visualization format. The interesting part is symbolic structure: named ops, arrows, and loop boundaries. SVG keeps that crisp at any scale and lets the page animate the progression without a heavy binary asset.
+</p>
+
+<p>
+  If you want a more runtime-oriented visualization later, the next useful artifact would be a generated trace from the actual interpreter, rendered into a timeline or a frame-by-frame GIF. But for explaining the model, SVG is the cleaner first post.
+</p>
+
+<footer>
+  <p>
+    <a href="index.html">Back to the main ANE post</a> &middot;
+    <a href="https://github.com/videlalvaro/emilio/tree/main/emilio/tag">Tag-system code</a> &middot;
+    <a href="https://github.com/videlalvaro/emilio/blob/main/paper_tag.tex">Paper source</a>
+  </p>
+</footer>
+
+</div>
+</body>
+</html>

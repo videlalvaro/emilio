@@ -1,0 +1,254 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 860" role="img" aria-labelledby="title desc">
+  <title id="title">Tiny-model token trace in the tag-system controller</title>
+  <desc id="desc">A 16-step flow chart for one token through the tiny one-layer model, from embed to halt.</desc>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #7d8590;
+      --attn: #58a6ff;
+      --ffn: #3fb950;
+      --tail: #a371f7;
+      --warn: #d29922;
+      --halt: #f85149;
+    }
+
+    text {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      fill: var(--text);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .frame {
+      fill: var(--bg);
+    }
+
+    .step {
+      stroke-width: 2;
+      rx: 16;
+      opacity: 0.42;
+      animation: flash 16s linear infinite;
+    }
+
+    .attn { fill: rgba(88, 166, 255, 0.15); stroke: var(--attn); }
+    .ffn { fill: rgba(63, 185, 80, 0.15); stroke: var(--ffn); }
+    .tail { fill: rgba(163, 113, 247, 0.17); stroke: var(--tail); }
+    .halt { fill: rgba(248, 81, 73, 0.15); stroke: var(--halt); }
+    .start { fill: rgba(210, 153, 34, 0.14); stroke: var(--warn); }
+
+    .arrow {
+      fill: none;
+      stroke: #7d8590;
+      stroke-width: 3;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      marker-end: url(#arrowhead);
+    }
+
+    .step-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .step-sub {
+      font-size: 12px;
+      fill: var(--muted);
+    }
+
+    .step-num {
+      font-size: 12px;
+      font-weight: 700;
+      fill: var(--muted);
+    }
+
+    .s1  { animation-delay: 0s; }
+    .s2  { animation-delay: 1s; }
+    .s3  { animation-delay: 2s; }
+    .s4  { animation-delay: 3s; }
+    .s5  { animation-delay: 4s; }
+    .s6  { animation-delay: 5s; }
+    .s7  { animation-delay: 6s; }
+    .s8  { animation-delay: 7s; }
+    .s9  { animation-delay: 8s; }
+    .s10 { animation-delay: 9s; }
+    .s11 { animation-delay: 10s; }
+    .s12 { animation-delay: 11s; }
+    .s13 { animation-delay: 12s; }
+    .s14 { animation-delay: 13s; }
+    .s15 { animation-delay: 14s; }
+    .s16 { animation-delay: 15s; }
+
+    @keyframes flash {
+      0%, 7% {
+        opacity: 1;
+        filter: drop-shadow(0 0 10px rgba(230, 237, 243, 0.18));
+      }
+      11%, 100% {
+        opacity: 0.42;
+        filter: none;
+      }
+    }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7d8590"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" width="1400" height="860"/>
+
+  <text x="58" y="54" font-size="30" font-weight="700">Tiny-model token trace</text>
+  <text x="58" y="86" font-size="16" fill="#7d8590">16 production rules: one layer worth of attention + FFN, then FINAL_NORM and LM_HEAD.</text>
+
+  <rect x="1080" y="42" width="262" height="74" rx="16" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="1104" y="72" class="mono" font-size="18">Tiny model: 16 steps</text>
+  <text x="1104" y="98" class="mono" font-size="18">Qwen 0.5B: 315 steps</text>
+
+  <path d="M 220 230 L 292 230" class="arrow"/>
+  <path d="M 514 230 L 586 230" class="arrow"/>
+  <path d="M 808 230 L 880 230" class="arrow"/>
+  <path d="M 1102 230 L 1174 230" class="arrow"/>
+
+  <path d="M 1246 266 C 1280 300, 1280 338, 1246 372" class="arrow"/>
+  <path d="M 1182 444 L 1110 444" class="arrow"/>
+  <path d="M 888 444 L 816 444" class="arrow"/>
+  <path d="M 594 444 L 522 444" class="arrow"/>
+  <path d="M 300 444 L 228 444" class="arrow"/>
+
+  <path d="M 154 480 C 120 516, 120 554, 154 588" class="arrow"/>
+  <path d="M 220 660 L 292 660" class="arrow"/>
+  <path d="M 514 660 L 586 660" class="arrow"/>
+  <path d="M 808 660 L 880 660" class="arrow"/>
+
+  <g transform="translate(58 160)">
+    <rect width="162" height="140" class="step start s1"/>
+    <text x="18" y="28" class="step-num mono">1</text>
+    <text x="18" y="62" class="step-title mono">EMBED</text>
+    <text x="18" y="92" class="step-sub">load token vector</text>
+    <text x="18" y="112" class="step-sub">next: RMSNORM_ATTN_0</text>
+  </g>
+
+  <g transform="translate(352 160)">
+    <rect width="162" height="140" class="step attn s2"/>
+    <text x="18" y="28" class="step-num mono">2</text>
+    <text x="18" y="62" class="step-title mono">RMSNORM</text>
+    <text x="18" y="92" class="step-sub">save residual</text>
+    <text x="18" y="112" class="step-sub">pre-attention norm</text>
+  </g>
+
+  <g transform="translate(646 160)">
+    <rect width="162" height="140" class="step attn s3"/>
+    <text x="18" y="28" class="step-num mono">3</text>
+    <text x="18" y="62" class="step-title mono">QKV_MATMUL</text>
+    <text x="18" y="92" class="step-sub">x @ W_qkv</text>
+    <text x="18" y="112" class="step-sub">fused projection</text>
+  </g>
+
+  <g transform="translate(940 160)">
+    <rect width="162" height="140" class="step attn s4"/>
+    <text x="18" y="28" class="step-num mono">4</text>
+    <text x="18" y="62" class="step-title mono">BIAS_ADD</text>
+    <text x="18" y="92" class="step-sub">add q / k / v bias</text>
+    <text x="18" y="112" class="step-sub">same layer</text>
+  </g>
+
+  <g transform="translate(1174 160)">
+    <rect width="162" height="140" class="step attn s5"/>
+    <text x="18" y="28" class="step-num mono">5</text>
+    <text x="18" y="62" class="step-title mono">ROPE</text>
+    <text x="18" y="92" class="step-sub">rotate q and k</text>
+    <text x="18" y="112" class="step-sub">by sequence pos</text>
+  </g>
+
+  <g transform="translate(940 374)">
+    <rect width="162" height="140" class="step attn s6"/>
+    <text x="18" y="28" class="step-num mono">6</text>
+    <text x="18" y="62" class="step-title mono">KV_STORE</text>
+    <text x="18" y="92" class="step-sub">append cache</text>
+    <text x="18" y="112" class="step-sub">trim state to Q</text>
+  </g>
+
+  <g transform="translate(646 374)">
+    <rect width="162" height="140" class="step attn s7"/>
+    <text x="18" y="28" class="step-num mono">7</text>
+    <text x="18" y="62" class="step-title mono">ATTENTION</text>
+    <text x="18" y="92" class="step-sub">softmax(QK^T)V</text>
+    <text x="18" y="112" class="step-sub">grouped-query</text>
+  </g>
+
+  <g transform="translate(352 374)">
+    <rect width="162" height="140" class="step attn s8"/>
+    <text x="18" y="28" class="step-num mono">8</text>
+    <text x="18" y="62" class="step-title mono">OUT_PROJ</text>
+    <text x="18" y="92" class="step-sub">attention @ W_o</text>
+    <text x="18" y="112" class="step-sub">back to d_model</text>
+  </g>
+
+  <g transform="translate(58 374)">
+    <rect width="162" height="140" class="step attn s9"/>
+    <text x="18" y="28" class="step-num mono">9</text>
+    <text x="18" y="62" class="step-title mono">RESIDUAL</text>
+    <text x="18" y="92" class="step-sub">add attention skip</text>
+    <text x="18" y="112" class="step-sub">next: FFN_NORM</text>
+  </g>
+
+  <g transform="translate(58 590)">
+    <rect width="162" height="140" class="step ffn s10"/>
+    <text x="18" y="28" class="step-num mono">10</text>
+    <text x="18" y="62" class="step-title mono">FFN_NORM</text>
+    <text x="18" y="92" class="step-sub">save residual</text>
+    <text x="18" y="112" class="step-sub">pre-FFN norm</text>
+  </g>
+
+  <g transform="translate(352 590)">
+    <rect width="162" height="140" class="step ffn s11"/>
+    <text x="18" y="28" class="step-num mono">11</text>
+    <text x="18" y="62" class="step-title mono">GATE_UP</text>
+    <text x="18" y="92" class="step-sub">x @ W_gate_up</text>
+    <text x="18" y="112" class="step-sub">2 * d_ff output</text>
+  </g>
+
+  <g transform="translate(646 590)">
+    <rect width="162" height="140" class="step ffn s12"/>
+    <text x="18" y="28" class="step-num mono">12</text>
+    <text x="18" y="62" class="step-title mono">SILU_MUL</text>
+    <text x="18" y="92" class="step-sub">SiLU(gate) * up</text>
+    <text x="18" y="112" class="step-sub">collapse to d_ff</text>
+  </g>
+
+  <g transform="translate(940 590)">
+    <rect width="162" height="140" class="step ffn s13"/>
+    <text x="18" y="28" class="step-num mono">13</text>
+    <text x="18" y="62" class="step-title mono">DOWN_PROJ</text>
+    <text x="18" y="92" class="step-sub">hidden @ W_down</text>
+    <text x="18" y="112" class="step-sub">back to d_model</text>
+  </g>
+
+  <g transform="translate(1174 590)">
+    <rect width="162" height="140" class="step ffn s14"/>
+    <text x="18" y="28" class="step-num mono">14</text>
+    <text x="18" y="62" class="step-title mono">RESIDUAL_FFN</text>
+    <text x="18" y="92" class="step-sub">add FFN skip</text>
+    <text x="18" y="112" class="step-sub">last layer -&gt; FINAL_NORM</text>
+  </g>
+
+  <g transform="translate(1174 742)">
+    <rect width="162" height="84" class="step tail s15"/>
+    <text x="18" y="24" class="step-num mono">15</text>
+    <text x="18" y="54" class="step-title mono">FINAL_NORM</text>
+    <text x="18" y="74" class="step-sub">output RMSNorm</text>
+  </g>
+
+  <g transform="translate(940 742)">
+    <rect width="162" height="84" class="step halt s16"/>
+    <text x="18" y="24" class="step-num mono">16</text>
+    <text x="18" y="54" class="step-title mono">LM_HEAD -&gt; HALT</text>
+    <text x="18" y="74" class="step-sub">logits, argmax, stop</text>
+  </g>
+</svg>
