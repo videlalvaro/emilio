@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Tag-system rewrite for one transformer operation</title>
+  <desc id="desc">A two-symbol word containing QKV_MATMUL and STATE is rewritten into a two-symbol word containing BIAS_ADD and STATE prime while preserving word length two.</desc>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --muted: #7d8590;
+      --text: #e6edf3;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --warn: #d29922;
+      --state: #a371f7;
+    }
+
+    text {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      fill: var(--text);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .card {
+      fill: var(--panel);
+      stroke: var(--border);
+      stroke-width: 1.5;
+      rx: 18;
+    }
+
+    .token {
+      rx: 14;
+      stroke-width: 2;
+    }
+
+    .op {
+      fill: rgba(88, 166, 255, 0.14);
+      stroke: var(--accent);
+    }
+
+    .next {
+      fill: rgba(63, 185, 80, 0.16);
+      stroke: var(--success);
+    }
+
+    .state {
+      fill: rgba(163, 113, 247, 0.16);
+      stroke: var(--state);
+    }
+
+    .label {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .small {
+      font-size: 14px;
+      fill: var(--muted);
+    }
+
+    .arrow {
+      fill: none;
+      stroke: var(--warn);
+      stroke-width: 4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      marker-end: url(#arrowhead);
+    }
+
+    .pulse-left {
+      animation: pulse-left 4s ease-in-out infinite;
+    }
+
+    .pulse-right {
+      animation: pulse-right 4s ease-in-out infinite;
+    }
+
+    @keyframes pulse-left {
+      0%, 25%, 100% { opacity: 0.85; }
+      12% { opacity: 1; filter: drop-shadow(0 0 8px rgba(88, 166, 255, 0.45)); }
+    }
+
+    @keyframes pulse-right {
+      0%, 45%, 100% { opacity: 0.82; }
+      62% { opacity: 1; filter: drop-shadow(0 0 8px rgba(63, 185, 80, 0.45)); }
+    }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d29922"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="520" fill="#0d1117"/>
+
+  <text x="56" y="56" font-size="30" font-weight="700">One production rule as a 2-tag rewrite</text>
+  <text x="56" y="88" class="small">The word stays length 2: read the current op, mutate STATE, emit the next pair.</text>
+
+  <rect x="50" y="126" width="290" height="248" class="card"/>
+  <text x="76" y="164" class="label">Current word</text>
+  <rect x="76" y="196" width="238" height="58" class="token op pulse-left"/>
+  <text x="101" y="231" class="mono" font-size="22">QKV_MATMUL_l</text>
+  <rect x="76" y="270" width="238" height="58" class="token state"/>
+  <text x="139" y="305" class="mono" font-size="22">STATE(x)</text>
+  <text x="76" y="350" class="small">Head symbol chooses the production.</text>
+
+  <rect x="420" y="126" width="360" height="248" class="card"/>
+  <text x="447" y="164" class="label">Production P(QKV_MATMUL_l)</text>
+  <text x="447" y="210" class="mono" font-size="22">qkv = x_norm @ W_qkv^(l)</text>
+  <text x="447" y="252" class="mono" font-size="22">STATE(x) -&gt; STATE(qkv)</text>
+  <text x="447" y="294" class="mono" font-size="22">next op = BIAS_ADD_l</text>
+  <text x="447" y="338" class="small">Classic view: append [BIAS_ADD_l, STATE(qkv)], then delete 2.</text>
+
+  <rect x="860" y="126" width="290" height="248" class="card"/>
+  <text x="886" y="164" class="label">Resulting word</text>
+  <rect x="886" y="196" width="238" height="58" class="token next pulse-right"/>
+  <text x="945" y="231" class="mono" font-size="22">BIAS_ADD_l</text>
+  <rect x="886" y="270" width="238" height="58" class="token state"/>
+  <text x="933" y="305" class="mono" font-size="22">STATE(qkv)</text>
+  <text x="886" y="350" class="small">Word invariant preserved: |word| = 2.</text>
+
+  <path d="M 340 252 C 376 252, 386 252, 418 252" class="arrow"/>
+  <path d="M 780 252 C 816 252, 826 252, 858 252" class="arrow"/>
+
+  <rect x="50" y="420" width="1100" height="52" rx="14" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="76" y="452" class="mono" font-size="22">[QKV_MATMUL_l, STATE(x)]  -&gt;  [BIAS_ADD_l, STATE(x @ W_qkv^(l))]</text>
+</svg>
