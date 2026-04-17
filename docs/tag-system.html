@@ -400,16 +400,6 @@ For L = 24: 1 + 24 &times; 13 + 2 = 315
   KV cache updates happen as side effects of rules like <code>KV_STORE</code>, but the controller still only needs the same two-symbol word to decide the next step.
 </p>
 
-<h2>Why SVG Fits Better Than GIF Here</h2>
-
-<p>
-  For this controller, SVG is the right visualization format. The interesting part is symbolic structure: named ops, arrows, and loop boundaries. SVG keeps that crisp at any scale and lets the page animate the progression without a heavy binary asset.
-</p>
-
-<p>
-  If you want a more runtime-oriented visualization later, the next useful artifact would be a generated trace from the actual interpreter, rendered into a timeline or a frame-by-frame GIF. But for explaining the model, SVG is the cleaner first post.
-</p>
-
 <footer>
   <p>
     <a href="index.html">Back to the main ANE post</a> &middot;
