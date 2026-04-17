@@ -67,21 +67,21 @@
     }
 
     .s1  { animation-delay: 0s; }
-    .s2  { animation-delay: -1s; }
-    .s3  { animation-delay: -2s; }
-    .s4  { animation-delay: -3s; }
-    .s5  { animation-delay: -4s; }
-    .s6  { animation-delay: -5s; }
-    .s7  { animation-delay: -6s; }
-    .s8  { animation-delay: -7s; }
-    .s9  { animation-delay: -8s; }
-    .s10 { animation-delay: -9s; }
-    .s11 { animation-delay: -10s; }
-    .s12 { animation-delay: -11s; }
-    .s13 { animation-delay: -12s; }
-    .s14 { animation-delay: -13s; }
-    .s15 { animation-delay: -14s; }
-    .s16 { animation-delay: -15s; }
+    .s2  { animation-delay: 1s; }
+    .s3  { animation-delay: 2s; }
+    .s4  { animation-delay: 3s; }
+    .s5  { animation-delay: 4s; }
+    .s6  { animation-delay: 5s; }
+    .s7  { animation-delay: 6s; }
+    .s8  { animation-delay: 7s; }
+    .s9  { animation-delay: 8s; }
+    .s10 { animation-delay: 9s; }
+    .s11 { animation-delay: 10s; }
+    .s12 { animation-delay: 11s; }
+    .s13 { animation-delay: 12s; }
+    .s14 { animation-delay: 13s; }
+    .s15 { animation-delay: 14s; }
+    .s16 { animation-delay: 15s; }
 
     @keyframes flash {
       0%, 7% {
