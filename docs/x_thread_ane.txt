@@ -1,0 +1,112 @@
+TRANSFORMER INFERENCE ON APPLE'S NEURAL ENGINE
+====================================================
+X/Twitter thread draft — April 2026
+====================================================
+
+
+── POST 1 (hook + image) ─────────────────────────────────────────
+
+I ran Qwen 2.5-0.5B entirely on Apple's Neural Engine — 171 tok/s, no GPU.
+
+The trick: every matrix multiply is a Conv2d(1×1). The ANE is a convolution accelerator, so let's give it convolutions.
+
+🧵👇
+
+[ATTACH: token_generation.gif]
+
+
+── POST 2 (the insight) ──────────────────────────────────────────
+
+A transformer is mostly matrix–vector products: y = Wx
+
+When spatial dimensions are 1×1, a convolution IS a matrix–vector product:
+
+y_i = Σ_j W_ij · x_j
+
+Reshape the hidden state from (896,) to (1, 896, 1, 1) — 896 "channels" of a single-pixel "image." Conv2d does the rest. No approximation.
+
+
+── POST 3 (the mapping) ──────────────────────────────────────────
+
+Qwen 2.5-0.5B mapped entirely to Conv2d(1×1):
+
+• QKV projection: Conv(896, 1152, 1)
+• Output proj: Conv(896, 896, 1)
+• Gate+Up: Conv(896, 9728, 1)
+• Down proj: Conv(4864, 896, 1)
+• LM head: Conv(896, 151936, 1)
+
+169 matmuls per token → 169 convolutions. All on the ANE's 16 convolution cores.
+
+[ATTACH: token_generation.gif]
+
+
+── POST 4 (optimization journey) ─────────────────────────────────
+
+The optimization journey: 9 → 171 tok/s (19×)
+
+• Baseline: 9 tok/s (conv-only model, naïve host code)
+• Theory-driven fixes: 90 tok/s (eliminated per-token allocations, fused KV scatter, batched GQA: 672→96 attn matmuls)
+• Pre-allocated buffers: ANE utilization 99.5%
+• Fixed-shape model: regressed to 78 tok/s (static shapes, but lost flexibility)
+• Stateful KV cache: 171 tok/s — MLState keeps KV on ANE, zero host copy
+
+[ATTACH: dataflow.gif]
+
+
+── POST 5 (the stateful KV win) ──────────────────────────────────
+
+The biggest win: CoreML's MLState API (macOS 15).
+
+Before: 23% of per-token time spent packing KV tensors into MLMultiArray. Another ~40% waiting for ANE to read them from host memory.
+
+After: KV cache stays on-device. The model writes in-place. Pack time: 0.00ms.
+
+5.67ms per token. The DRAM bandwidth floor is 4.7ms (472 MB int8 @ 100 GB/s). We're within 2×.
+
+
+── POST 6 (what runs where) ──────────────────────────────────────
+
+What runs where on the M4 Max:
+
+ANE convolution cores (16): All 169 matmuls per token
+ANE element-wise ALUs: RMSNorm, RoPE, softmax, SiLU
+CPU: Tokenization, argmax, embedding lookup
+
+The GPU is completely idle. The entire forward pass is on the ANE.
+
+
+── POST 7 (the model) ────────────────────────────────────────────
+
+Model details:
+
+• Qwen 2.5-0.5B-Instruct — 24 layers, d=896, 14 query heads, 2 KV heads
+• Int8 block-wise quantization (block size 32) — 472 MB
+• Converted from GGUF → CoreML via custom Python converter (coremltools 9.0)
+• Swift host for inference
+
+The converter maps every Linear to Conv2d(1×1) and every attention layer to batched GQA convolutions.
+
+
+── POST 8 (closing + links) ──────────────────────────────────────
+
+Full write-up with animated diagrams:
+https://videlalvaro.github.io/emilio/
+
+Source code (GGUF→CoreML converter + Swift inference engine):
+https://github.com/videlalvaro/emilio
+
+Hardware: Apple M4 Max
+Stack: Python + coremltools 9.0 → CoreML + Swift
+
+
+====================================================
+ASSETS CHECKLIST
+====================================================
+
+Post 1:  token_generation.gif (docs/emilio/conv-ane/gifs/token_generation.gif) — shows real ANE inference
+Post 3:  (same gif already used in post 1, skip or reuse)
+Post 4:  dataflow.gif (docs/emilio/conv-ane/gifs/dataflow.gif) — 2.2MB
+
+Note: X supports GIF uploads up to 15MB. All files are well under.
+Note: Links are in post 8 only — X penalizes external links in engagement-critical first tweet.

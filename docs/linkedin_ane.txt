@@ -1,0 +1,43 @@
+TRANSFORMER INFERENCE ON APPLE'S NEURAL ENGINE
+====================================================
+LinkedIn post draft — April 2026
+====================================================
+
+What better way to learn about LLMs and inference than to build your own inference engine from scratch?
+
+I ran Qwen 2.5-0.5B entirely on Apple's Neural Engine — 171 tokens/second, with the GPU completely idle.
+
+The key insight: the ANE is a convolution accelerator. A transformer is mostly matrix–vector products (y = Wx). When spatial dimensions are 1×1, a convolution IS a matrix–vector product. So I reshaped every hidden state into a single-pixel "image" and replaced every Linear layer with Conv2d(1×1). No approximation — mathematically identical.
+
+The result: 169 convolutions per token, all running on the ANE's 16 convolution cores.
+
+Getting there was a journey. The first working version ran at 9 tok/s. From there:
+
+→ Eliminated per-token memory allocations and fused KV scatter operations: 90 tok/s
+→ Pre-allocated buffers brought ANE utilization to 99.5%
+→ Fixed-shape models actually regressed to 78 tok/s (lesson learned)
+→ The real breakthrough: CoreML's MLState API (macOS 15) — keeping the KV cache on-device, zero host copies. That got us to 171 tok/s.
+
+That's a 19× improvement from baseline, and we're within 2× of the DRAM bandwidth floor (472 MB model at 100 GB/s).
+
+The whole stack is Python + coremltools 9.0 for model conversion (GGUF → CoreML), and Swift for the inference host. Int8 block-wise quantization keeps the model at 472 MB.
+
+I wrote up the full story with animated diagrams showing exactly how the data flows through the ANE:
+https://videlalvaro.github.io/emilio/
+
+Source code (converter + inference engine):
+https://github.com/videlalvaro/emilio
+
+#MachineLearning #LLM #AppleSilicon #NeuralEngine #CoreML #Inference #Swift #Qwen #AI 
+
+[ATTACH: token_generation.gif]
+
+
+====================================================
+NOTES
+====================================================
+
+- LinkedIn supports GIF/video in posts
+- Links are fine on LinkedIn (no penalty like X)
+- Single post format (no threads on LinkedIn)
+- Character limit: ~3,000 for posts (this is well under)
