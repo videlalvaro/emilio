@@ -6,6 +6,7 @@ models/
 __pycache__/
 *.pyc
 .venv/
+.venv313/
 
 # Rust
 target/
@@ -39,17 +40,71 @@ emilio/mov/build/
 emilio/tag/build/
 
 # Private API exploration (archived)
-emilio/gol-ane/_private_api_archive/
+emilio/conv-ane/_private_api_archive/
 
-# GOL-ANE generated artifacts (rebuild with build.sh / gguf_to_ane.py)
-emilio/gol-ane/*.mlpackage/
-emilio/gol-ane/*.mlmodelc/
-emilio/gol-ane/*_embd.bin
-emilio/gol-ane/*_tokenizer.json
-emilio/gol-ane/*_meta.json
-emilio/gol-ane/gol_ane
-emilio/gol-ane/qwen_ane
-emilio/gol-ane/qwen_conv
-emilio/gol-ane/qwen_ane_direct
-emilio/gol-ane/bench_*
-emilio/gol-ane/energy_results/
+# Conv-ANE generated artifacts (rebuild with build.sh / gguf_to_ane.py)
+emilio/conv-ane/*.mlpackage/
+emilio/conv-ane/*.mlmodelc/
+emilio/conv-ane/*_embd.bin
+emilio/conv-ane/*_tokenizer.json
+emilio/conv-ane/*_meta.json
+emilio/conv-ane/conv_ane
+emilio/conv-ane/qwen_ane
+emilio/conv-ane/qwen_conv
+emilio/conv-ane/qwen_ane_direct
+emilio/conv-ane/bench_*
+emilio/conv-ane/energy_results/
+
+# GOL-ANE-inference generated artifacts
+emilio/gol-ane-inference/*.mlpackage/
+emilio/gol-ane-inference/*.mlmodelc/
+emilio/gol-ane-inference/gol_ane
+emilio/gol-ane-inference/gol_ane_dbg
+emilio/gol-ane-inference/gol_ane_dbg.dSYM/
+emilio/gol-ane-inference/gol_computer.bin
+emilio/gol-ane-inference/gifs/
+
+# GOL-inference reference repos (cloned separately)
+emilio/gol-inference/gol-computer-ref/
+emilio/gol-inference/scalable-ref/
+
+# Social media drafts
+docs/social/
+# Handoff docs (internal, not for public repo)
+docs/handoff_*.md
+tmp/
+
+# Privacy-filter: vendor source + model weights (2.6 GB, download separately)
+python/privacy/_vendor_src/
+# Privacy-filter: golden data + swift debug dumps (rebuild via pf_moe_goldens.py)
+python/privacy/out/
+# Privacy-filter: dangling symlink to out/ (ignored above)
+python/privacy/pf_layer0_moe.npz
+
+# Privacy-filter: compiled mlmodelc/mlpackage caches (rebuild via build scripts)
+emilio/conv-ane/PF_swift/
+emilio/conv-ane/PF_*.mlpackage/
+emilio/conv-ane/PF_*.mlmodelc/
+emilio/conv-ane/_pf_*/
+emilio/conv-ane/_gather_probe/
+# Privacy-filter: intermediate bin dumps
+emilio/conv-ane/_pf_chain_L*_*.bin
+emilio/conv-ane/_pf_topk_*.bin
+# Privacy-filter: compiled Swift binaries (rebuild via swiftc)
+# Use negation to keep .swift sources
+emilio/conv-ane/pf_ane_smoke*
+!emilio/conv-ane/pf_ane_smoke*.swift
+emilio/conv-ane/pf_attn_probe*
+!emilio/conv-ane/pf_attn_probe*.swift
+emilio/conv-ane/pf_attn4_fp32_probe
+!emilio/conv-ane/pf_attn4_fp32_probe.swift
+emilio/conv-ane/pf_cache_probe
+!emilio/conv-ane/pf_cache_probe.swift
+emilio/conv-ane/pf_chain_per_expert
+!emilio/conv-ane/pf_chain_per_expert.swift
+emilio/conv-ane/pf_chain_pipelined
+!emilio/conv-ane/pf_chain_pipelined.swift
+emilio/conv-ane/pf_chain_profile
+!emilio/conv-ane/pf_chain_profile.swift
+emilio/conv-ane/pf_e2e
+!emilio/conv-ane/pf_e2e.swift
