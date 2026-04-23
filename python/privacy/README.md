@@ -1,8 +1,33 @@
-# Privacy Filter on ANE — Build & Run Guide
+# Privacy Filter on Apple's Neural Engine
 
-Run OpenAI's [privacy-filter](https://github.com/openai/openai-privacy-filter) MoE
-NER model end-to-end on Apple's Neural Engine via 1,033 CoreML graphs dispatched
-from pure Swift.
+**15× faster. 19× less energy. Same accuracy.**
+
+OpenAI's [privacy-filter](https://github.com/openai/openai-privacy-filter) is a
+Mixture-of-Experts NER model (8 layers, 128 experts, top-4 routing, ~1.5B total
+parameters). The canonical implementation runs on CPU via PyTorch at **1.65 sentences/sec**,
+drawing **15.4 J per sentence** of package power.
+
+This port runs the same model entirely on Apple's Neural Engine — no GPU, no cloud —
+at **24.6 sentences/sec** and **0.8 J per sentence**. Every entity span matches the
+reference output exactly (span F1 = 100%).
+
+| | CPU (PyTorch) | ANE (this repo) | |
+|---|---|---|---|
+| Throughput | 1.65 sent/s | **24.6 sent/s** | **15× faster** |
+| Energy per sentence | 15,385 mJ | **812 mJ** | **19× less** |
+| ANE power draw | 0 W | 0.22 W | — |
+| Span F1 | 100% | 100% | — |
+
+> Measured on M4 Max (48 GB), macOS 15, 30-second sustained run via `powermetrics`.
+
+The trick: instead of one monolithic graph (which hits the ANE's 96 MB cliff and
+falls back to GPU), each of the 1,024 experts is compiled as its own CoreML model.
+At runtime, Swift dispatches the router's top-4 picks concurrently. Result: 1,033
+compiled `.mlmodelc` files, 2.75 ms per MoE layer, full ANE residency.
+
+---
+
+## Build & Run Guide
 
 **Hardware**: Apple Silicon Mac with ANE (tested on M4 Max, 48 GB).
 **macOS**: 15+ (CoreML 9 / Xcode 16+).
@@ -196,9 +221,38 @@ DEMO_DELAY=0.1 bash demo/demo_redact.sh
 
 ## Performance
 
-|  | CPU (PyTorch) | ANE (Swift) | Δ |
-|--|--------------|-------------|---|
-| Throughput | 1.65 sent/s | 24.6 sent/s | 15× |
-| Energy/sent | 15,385 mJ | 812 mJ | 19× less |
-| ANE power | 0 W | 0.22 W | — |
+Measured on M4 Max (48 GB, 16 ANE cores), macOS 15, 30-second sustained run
+via `scripts/pf_energy_probe.sh` with `sudo powermetrics`.
+
+### Throughput & Accuracy
+
+|  | CPU (PyTorch) | ANE (Swift, fused packs) | Δ |
+|--|--------------|--------------------------|---|
+| Throughput | 1.65 sent/s | **24.6 sent/s** | **15×** |
+| Latency/sent | 606 ms | 40.7 ms | 15× faster |
 | Span F1 | 100% | 100% | — |
+
+### Energy
+
+|  | CPU (PyTorch) | ANE (Swift, fused packs) | Δ |
+|--|--------------|--------------------------|---|
+| PKG energy/sent | 15,385 mJ | **812 mJ** | **19× less** |
+| ANE power | 0 W | 0.22 W | — |
+| GPU power | idle | idle | — |
+
+The per-expert dispatch strategy (1,024 small graphs + 8 fused attention/router
+packs + 1 tail pack = 1,033 CoreML models) keeps every expert prediction on ANE.
+The alternative — a single gather-based dense graph — falls off ANE to GPU once
+the expert dimension exceeds the 96 MB single-graph cliff.
+
+### Model Architecture (for context)
+
+| Parameter | Value |
+|-----------|-------|
+| Layers | 8 |
+| Experts/layer | 128 (top-K = 4) |
+| Hidden dim | 640 |
+| Expert FFN dim | 64 |
+| Active params/token | ~50 M |
+| Total params | ~1.5 B |
+| NER labels | 33 (BIOES scheme) |
