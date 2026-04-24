@@ -368,17 +368,29 @@ def main():
     print("="*60)
     shared = export_shared_artifacts(gguf_path, output_dir, cfg, args.seq_len)
 
-    # ── Convert each shard ──
+    # ── Convert each shard (with resume: skip existing) ──
     shard_info = []
     for i, (layer_start, layer_end) in enumerate(boundaries):
-        pkg_path = convert_shard(
-            gguf_path, layer_start, layer_end, output_dir,
-            args.seq_len, args.quant_bits, args.group_size,
-            args.quant_strategy, python_path)
+        # Check if .mlpackage already exists (resume after interrupt)
+        existing_pkg = list(output_dir.glob(f"*_s{layer_start}-{layer_end}*.mlpackage"))
+        if existing_pkg:
+            pkg_path = existing_pkg[0]
+            print(f"\n  ⏭ Shard [{layer_start},{layer_end}) already exists: {pkg_path.name}, skipping conversion")
+        else:
+            pkg_path = convert_shard(
+                gguf_path, layer_start, layer_end, output_dir,
+                args.seq_len, args.quant_bits, args.group_size,
+                args.quant_strategy, python_path)
 
         if not args.skip_compile:
-            compiled = compile_shard(pkg_path, output_dir)
-            shard_path = compiled.name
+            # Check if .mlmodelc already exists
+            expected_compiled = output_dir / (pkg_path.stem + ".mlmodelc")
+            if expected_compiled.exists():
+                print(f"  ⏭ Compiled shard already exists: {expected_compiled.name}, skipping compile")
+                shard_path = expected_compiled.name
+            else:
+                compiled = compile_shard(pkg_path, output_dir)
+                shard_path = compiled.name
         else:
             shard_path = pkg_path.name
 
