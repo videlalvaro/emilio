@@ -108,3 +108,21 @@ emilio/conv-ane/pf_chain_profile
 !emilio/conv-ane/pf_chain_profile.swift
 emilio/conv-ane/pf_e2e
 !emilio/conv-ane/pf_e2e.swift
+
+# Gemma ANE: compiled Swift binaries (rebuild via swiftc)
+emilio/conv-ane/gemma_ane
+!emilio/conv-ane/gemma_ane.swift
+# Gemma ANE: Obj-C probe binaries (rebuild via clang)
+emilio/conv-ane/ane_chain_probe
+emilio/conv-ane/ane_class_dump
+emilio/conv-ane/qwen_ane_dbg
+# Gemma ANE: experiment output / model artifacts (rebuild via gemma_to_ane.py)
+python/moe/out/
+# Gemma ANE: misc scratch
+emilio/conv-ane/script_output.txt
+
+# Weights (large binary files, download separately)
+weights/
+
+# Book / docs drafts
+docs/ane_book/
