@@ -209,7 +209,7 @@ def find_coremltools_python():
         try:
             result = subprocess.run(
                 [py, "-c", "import coremltools; print(coremltools.__version__)"],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 ver = result.stdout.strip()
                 print(f"  Using {py} (coremltools {ver})")
@@ -304,6 +304,8 @@ def main():
                         help="Override number of layers (default: all from GGUF)")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="Print shard plan without converting")
+    parser.add_argument("--python", type=str, default=None,
+                        help="Python interpreter with coremltools (skip auto-discovery)")
     args = parser.parse_args()
 
     gguf_path = Path(args.gguf).resolve()
@@ -359,8 +361,12 @@ def main():
     print(f"\n  Output: {output_dir}")
 
     # ── Find Python with coremltools ──
-    print("\nLocating coremltools Python...")
-    python_path = find_coremltools_python()
+    if args.python:
+        python_path = args.python
+        print(f"\nUsing specified Python: {python_path}")
+    else:
+        print("\nLocating coremltools Python...")
+        python_path = find_coremltools_python()
 
     # ── Export shared artifacts ──
     print("\n" + "="*60)
