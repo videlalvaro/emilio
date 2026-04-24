@@ -1659,7 +1659,9 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
 
 # ─── Stateful Model (KV cache as on-device state, zero host↔ANE copy) ───────
 
-def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32, strategy="uniform"):
+def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0,
+                         group_size=32, strategy="uniform",
+                         layer_start=None, layer_end=None):
     """Build a stateful CoreML model with KV cache as MLState.
 
     Key differences from build_fixed_model():
@@ -1667,6 +1669,13 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     - No KV inputs or outputs — model reads/writes state internally
     - Eliminates all host↔ANE KV data transfer (~6MB per token)
     - Layers do in-place scatter-write to state buffers
+
+    Sharding (layer_start / layer_end):
+    - When set, builds only layers [layer_start, layer_end)
+    - Output is "hidden" (1, d, 1, 1) instead of "logits" — no LM head
+    - Each shard has its own KV state (locally numbered 0..N-1)
+    - Embedding lookup, final norm, and LM head are done on host
+    - This follows the proven Gemma multi-shard pattern
 
     NOTE: seq_len must be ≥ 1637 to avoid a CoreML CPU-backend state bug
     that produces NaN at forward pass 3. The threshold depends on model
@@ -1691,6 +1700,16 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         n_layers = cfg["n_layers"]
     n_layers = min(n_layers, cfg["n_layers"])
 
+    # Shard range: [layer_start, layer_end). Default = full model.
+    if layer_start is None:
+        layer_start = 0
+    if layer_end is None:
+        layer_end = n_layers
+    is_shard = (layer_start != 0) or (layer_end != n_layers)
+    shard_n = layer_end - layer_start
+    assert 0 <= layer_start < layer_end <= n_layers, \
+        f"Invalid layer range [{layer_start}, {layer_end}) for {n_layers} layers"
+
     d = cfg["d_model"]
     nh = cfg["n_heads"]
     nkv = cfg["n_kv_heads"]
@@ -1702,7 +1721,8 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     qkv_dim = d + 2 * kv_dim
     hpk = nh // nkv
 
-    print(f"Config: {n_layers}L, d={d}, nh={nh}, nkv={nkv}, dh={dh}, dff={dff}")
+    shard_tag = f" [shard {layer_start}-{layer_end}]" if is_shard else ""
+    print(f"Config: {n_layers}L, d={d}, nh={nh}, nkv={nkv}, dh={dh}, dff={dff}{shard_tag}")
     print(f"Fixed seq len: {max_seq_len}, Float16, batched GQA, STATEFUL KV")
 
     # ── Load embeddings ──
@@ -1865,22 +1885,32 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             return x
 
     class QwenStatefulConv(nn.Module):
-        """Full Qwen — stateful KV cache (register_buffer), batched GQA."""
-        def __init__(self, gguf_model, cfg, n_layers, max_seq_len):
+        """Full Qwen — stateful KV cache (register_buffer), batched GQA.
+
+        When is_shard=True, builds only layers [layer_start, layer_end) and
+        outputs hidden state (1, d, 1, 1) instead of logits. LM head and
+        output norm are omitted — host does final projection.
+        """
+        def __init__(self, gguf_model, cfg, n_layers, max_seq_len,
+                     layer_start=0, layer_end=None, is_shard=False):
             super().__init__()
-            self.n_layers = n_layers
+            if layer_end is None:
+                layer_end = n_layers
+            self.shard_n = layer_end - layer_start
             self.d = cfg["d_model"]
             self.nkv = cfg["n_kv_heads"]
             self.dh = cfg["d_head"]
             self.max_seq_len = max_seq_len
+            self.is_shard = is_shard
 
             self.layers = nn.ModuleList()
-            for i in range(n_layers):
-                print(f"  Layer {i}/{n_layers}")
+            for i in range(layer_start, layer_end):
+                local = i - layer_start
+                print(f"  Layer {i} (local {local}/{self.shard_n})")
                 self.layers.append(StatefulLayerConv(i, gguf_model, cfg))
 
-            # Register KV caches as state buffers — these become ct.StateType
-            for i in range(n_layers):
+            # Register KV caches as state buffers (locally numbered 0..shard_n-1)
+            for i in range(self.shard_n):
                 self.register_buffer(f"k_cache_{i}",
                     torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
                                 dtype=torch.float16))
@@ -1888,24 +1918,26 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
                     torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
                                 dtype=torch.float16))
 
-            out_norm_w = gguf_model.get_tensor("output_norm.weight")
-            self.output_norm = RMSNormConv(out_norm_w, cfg["rms_norm_eps"])
+            if not is_shard:
+                # Full model: include output norm + LM head
+                out_norm_w = gguf_model.get_tensor("output_norm.weight")
+                self.output_norm = RMSNormConv(out_norm_w, cfg["rms_norm_eps"])
 
-            print("  LM head...")
-            if "output.weight" in gguf_model.tensors:
-                lm_w = gguf_model.get_tensor("output.weight")
-            else:
-                lm_w = gguf_model.get_tensor("token_embd.weight")
-            self.lm_head_conv = nn.Conv2d(cfg["d_model"], cfg["vocab_size"], 1, bias=False)
-            self.lm_head_conv.weight = nn.Parameter(
-                torch.tensor(lm_w, dtype=torch.float16).reshape(
-                    cfg["vocab_size"], cfg["d_model"], 1, 1),
-                requires_grad=False)
+                print("  LM head...")
+                if "output.weight" in gguf_model.tensors:
+                    lm_w = gguf_model.get_tensor("output.weight")
+                else:
+                    lm_w = gguf_model.get_tensor("token_embd.weight")
+                self.lm_head_conv = nn.Conv2d(cfg["d_model"], cfg["vocab_size"], 1, bias=False)
+                self.lm_head_conv.weight = nn.Parameter(
+                    torch.tensor(lm_w, dtype=torch.float16).reshape(
+                        cfg["vocab_size"], cfg["d_model"], 1, 1),
+                    requires_grad=False)
 
         def forward(self, x, rope_cos_pos, rope_sin_pos, attn_mask, kv_write_mask):
             """
             No KV inputs/outputs — state is read/written internally.
-            Returns: logits only.
+            Returns: logits (full model) or hidden (shard).
             """
             for i, layer in enumerate(self.layers):
                 k_cache = getattr(self, f"k_cache_{i}")
@@ -1913,14 +1945,21 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
                 x = layer(x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
                           attn_mask, kv_write_mask)
 
+            if self.is_shard:
+                # Shard: output hidden state for next shard
+                return x
+
             x = self.output_norm(x)
             logits = self.lm_head_conv(x).squeeze(-1).squeeze(-1)
             return logits
 
     # ── Build ────────────────────────────────────────────────────────────
 
-    print(f"\nBuilding QwenStatefulConv ({n_layers}L, fp16, stateful KV)...")
-    model = QwenStatefulConv(gguf, cfg, n_layers, max_seq_len)
+    build_tag = f" shard [{layer_start},{layer_end})" if is_shard else ""
+    print(f"\nBuilding QwenStatefulConv ({shard_n}L, fp16, stateful KV{build_tag})...")
+    model = QwenStatefulConv(gguf, cfg, n_layers, max_seq_len,
+                             layer_start=layer_start, layer_end=layer_end,
+                             is_shard=is_shard)
     model.half()
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
@@ -1960,7 +1999,10 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     print("\nTracing (stateful KV)...")
     with torch.no_grad():
         output = model(x_ex, cos_ex, sin_ex, mask_ex, wmask_ex)
-        print(f"  logits: {output.shape}, dtype: {output.dtype}")
+        if is_shard:
+            print(f"  hidden: {output.shape}, dtype: {output.dtype}")
+        else:
+            print(f"  logits: {output.shape}, dtype: {output.dtype}")
 
     traced = torch.jit.trace(model, (x_ex, cos_ex, sin_ex, mask_ex, wmask_ex))
 
@@ -1968,13 +2010,14 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     # into caches (fp16 overflow at dh=128), and NaN != NaN breaks coremltools'
     # torch.equal() assertion in _lower_graph_block.
     with torch.no_grad():
-        for i in range(n_layers):
+        for i in range(shard_n):
             getattr(model, f"k_cache_{i}").zero_()
             getattr(model, f"v_cache_{i}").zero_()
 
     # ── Convert to CoreML ────────────────────────────────────────────────
 
-    print(f"\nConverting to CoreML (fp16, {n_layers}L, STATEFUL KV)...")
+    conv_tag = f" shard [{layer_start},{layer_end})" if is_shard else ""
+    print(f"\nConverting to CoreML (fp16, {shard_n}L, STATEFUL KV{conv_tag})...")
 
     ct_inputs = [
         ct.TensorType(name="x", shape=(1, d, 1, 1), dtype=np.float16),
@@ -1984,11 +2027,14 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         ct.TensorType(name="kv_write_mask", shape=(1, 1, max_seq_len, 1), dtype=np.float16),
     ]
 
-    ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
+    if is_shard:
+        ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
+    else:
+        ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
 
     # KV caches as state — these stay on-device between calls
     ct_states = []
-    for i in range(n_layers):
+    for i in range(shard_n):
         ct_states.append(ct.StateType(
             wrapped_type=ct.TensorType(shape=(1, nkv, max_seq_len, dh), dtype=np.float16),
             name=f"k_cache_{i}"))
@@ -2028,7 +2074,10 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         suffix = f"_q{quant_bits}{strat_tag}" + (f"g{group_size}" if group_size != 32 else "")
     else:
         suffix = ""
-    prefix = f"QwenANE_{n_layers}L_stateful{suffix}"
+    if is_shard:
+        prefix = f"QwenANE_{n_layers}L_s{layer_start}-{layer_end}{suffix}"
+    else:
+        prefix = f"QwenANE_{n_layers}L_stateful{suffix}"
     pkg_path = f"{prefix}.mlpackage"
     mlmodel.save(pkg_path)
     print(f"\n✓ Saved {pkg_path}")
@@ -2037,43 +2086,54 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
 
     meta = {
         **cfg,
-        "n_layers_exported": n_layers,
+        "n_layers_exported": shard_n,
+        "n_layers_total": n_layers,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
         "max_seq_len": max_seq_len,
         "dtype": "float16",
         "fixed_shapes": True,
         "batched_gqa": True,
         "stateful_kv": True,
+        "is_shard": is_shard,
         "quant_bits": quant_bits,
-        "rope_cos": rope_cos.tolist(),
-        "rope_sin": rope_sin.tolist(),
     }
+    if not is_shard:
+        # Full model: include RoPE tables in per-model meta (legacy compat)
+        meta["rope_cos"] = rope_cos.tolist()
+        meta["rope_sin"] = rope_sin.tolist()
     meta_path = f"{prefix}_meta.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f)
     print(f"  Meta: {meta_path}")
 
-    # ── Embeddings ───────────────────────────────────────────────────────
+    # ── Shared artifacts (only for full model, not shards) ───────────────
+    # When sharding, the orchestrator exports these once for all shards.
 
-    embd_path = f"{prefix}_embd.bin"
-    token_embd.astype(np.float16).tofile(embd_path)
-    print(f"  Embeddings: {embd_path} ({Path(embd_path).stat().st_size / 1e6:.1f} MB)")
+    if not is_shard:
+        # ── Embeddings ──
+        embd_path = f"{prefix}_embd.bin"
+        token_embd.astype(np.float16).tofile(embd_path)
+        print(f"  Embeddings: {embd_path} ({Path(embd_path).stat().st_size / 1e6:.1f} MB)")
 
-    # ── BPE Tokenizer ────────────────────────────────────────────────────
+        # ── BPE Tokenizer ──
+        print("Exporting BPE tokenizer...")
+        tok_data = gguf.extract_tokenizer()
+        tok_path = f"{prefix}_tokenizer.json"
+        with open(tok_path, "w") as f:
+            json.dump(tok_data, f)
+        print(f"  Tokenizer: {tok_path}")
 
-    print("Exporting BPE tokenizer...")
-    tok_data = gguf.extract_tokenizer()
-    tok_path = f"{prefix}_tokenizer.json"
-    with open(tok_path, "w") as f:
-        json.dump(tok_data, f)
-    print(f"  Tokenizer: {tok_path}")
-
+    output_kind = "hidden (shard)" if is_shard else "logits"
     print(f"\n{'='*60}")
-    print(f"  Model:      Qwen2.5 ({n_layers}L, d={d}, nh={nh}, nkv={nkv})")
+    print(f"  Model:      Qwen2.5 ({shard_n}L [{layer_start},{layer_end}), d={d}, nh={nh}, nkv={nkv})")
     print(f"  Format:     CoreML mlprogram (iOS18+)")
     print(f"  KV Cache:   STATEFUL (on-device, zero host copy)")
-    print(f"  Attention:  Batched GQA ({n_layers * nkv * 2} matmul ops)")
+    print(f"  Attention:  Batched GQA ({shard_n * nkv * 2} matmul ops)")
+    print(f"  Output:     {output_kind}")
     print(f"  Dtype:      Float16{f' + int{quant_bits} weights' if quant_bits else ''}")
-    print(f"  Tokenizer:  BPE ({len(tok_data['tokens'])} vocab)")
+    if not is_shard:
+        print(f"  Tokenizer:  BPE ({len(tok_data['tokens'])} vocab)")
     print(f"  Target:     ANE (CPU_AND_NE, seq_len≥1637 state-bug guard)")
     print(f"{'='*60}")
 
@@ -2108,12 +2168,17 @@ def main():
                         help="Build fixed-shape model (eliminates dynamic shapes)")
     parser.add_argument("--stateful", action="store_true",
                         help="Build stateful model (KV cache as on-device state)")
+    parser.add_argument("--layer-start", type=int, default=None, dest="layer_start",
+                        help="First layer index for shard (inclusive). Requires --stateful.")
+    parser.add_argument("--layer-end", type=int, default=None, dest="layer_end",
+                        help="Last layer index for shard (exclusive). Requires --stateful.")
     args = parser.parse_args()
 
     if args.stateful:
         build_stateful_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
                              quant_bits=args.quant_bits, group_size=args.group_size,
-                             strategy=args.quant_strategy)
+                             strategy=args.quant_strategy,
+                             layer_start=args.layer_start, layer_end=args.layer_end)
     elif args.fixed:
         build_fixed_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
                           quant_bits=args.quant_bits, group_size=args.group_size,
