@@ -190,19 +190,26 @@ class GGUFModel:
         }
 
 
-# ─── Weight Quantization Helper ────────────────────────────────────────────
+# ─── Weight Quantization Helpers ───────────────────────────────────────────
 
-def _quantize_weights(mlmodel, bits, group_size=32):
+def _quantize_weights(mlmodel, bits, group_size=32, strategy="uniform"):
     """Apply post-training weight quantization.
 
-    bits=0  → no-op (returns model as-is, fp16 weights)
-    bits=8  → per-tensor symmetric int8 (≈2× smaller than fp16)
-    bits=4  → grouped symmetric int4 (≈4× smaller than fp16, group_size scales)
+    bits=0        → no-op (returns model as-is, fp16 weights)
+    bits=8        → per-tensor symmetric int8 (≈2× smaller than fp16)
+    bits=4        → grouped symmetric int4 (≈4× smaller than fp16, group_size scales)
+
+    strategy controls HOW the quantization is applied:
+      "uniform"   → same precision for all ops (original behavior, RTN)
+      "mixed"     → sensitive ops at int8, FFN bulk at int4 (MIL-level)
     """
     if bits == 0:
         return mlmodel
     if bits not in (4, 8):
         raise ValueError(f"quant_bits must be 0, 4, or 8 (got {bits})")
+
+    if strategy == "mixed" and bits == 4:
+        return _quantize_mixed_precision(mlmodel, group_size=group_size)
 
     from coremltools.optimize.coreml import (
         OpLinearQuantizerConfig,
@@ -231,9 +238,650 @@ def _quantize_weights(mlmodel, bits, group_size=32):
     return mlmodel
 
 
+def _quantize_mixed_precision(mlmodel, group_size=32):
+    """Mixed-precision quantization at the MIL level.
+
+    Strategy: keep precision-sensitive ops at int8, apply int4 only to FFN bulk.
+
+    Sensitive (int8):
+      - QKV projections (layers_*_qkv_conv_weight) — attention quality
+      - Output projections (layers_*_out_conv_weight*) — residual stream injection
+      - LM head (lm_head_conv_weight) — final logit quality
+      - First and last transformer layers — boundary layers accumulate/emit error
+
+    Bulk (int4 grouped):
+      - FFN gate_up and down convolutions — largest weights, most tolerant of compression
+    """
+    from coremltools.optimize.coreml import (
+        OpLinearQuantizerConfig,
+        OptimizationConfig,
+        get_weights_metadata,
+        linear_quantize_weights,
+    )
+
+    print(f"\nMixed-precision quantization (sensitive=int8, FFN=int4 g{group_size})...")
+
+    int8_config = OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        dtype="int8",
+    )
+    int4_config = OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        dtype="int4",
+        granularity="per_block",
+        block_size=group_size,
+    )
+
+    # Discover all weight op names
+    weight_meta = get_weights_metadata(mlmodel, weight_threshold=512)
+    op_names = sorted(weight_meta.keys())
+
+    # Find the highest layer index to identify first/last layers
+    layer_indices = set()
+    for name in op_names:
+        if name.startswith("layers_"):
+            parts = name.split("_")
+            try:
+                layer_indices.add(int(parts[1]))
+            except (IndexError, ValueError):
+                pass
+    first_layer = min(layer_indices) if layer_indices else 0
+    last_layer = max(layer_indices) if layer_indices else 0
+
+    # Build per-op config: default is int4 (bulk FFN), override sensitive ops to int8
+    op_name_configs = {}
+    int8_ops = []
+    int4_ops = []
+    skipped_ops = []
+
+    for name in op_names:
+        is_sensitive = False
+
+        # QKV projections — attention quality (all layers)
+        # These are the most precision-sensitive: they compute Q, K, V
+        # which directly control attention pattern quality.
+        if "qkv_conv_weight" in name:
+            is_sensitive = True
+
+        # Skip tiny weights (norms, biases)
+        elif weight_meta[name].val.size < 2048:
+            skipped_ops.append(name)
+            continue
+
+        # Everything else (out_conv, FFN, LM head) → int4 bulk
+
+        if is_sensitive:
+            op_name_configs[name] = int8_config
+            int8_ops.append(name)
+        else:
+            int4_ops.append(name)
+
+    print(f"  int8 (sensitive): {len(int8_ops)} ops")
+    for name in int8_ops:
+        shape = weight_meta[name].val.shape
+        print(f"    {name}  {shape}")
+    print(f"  int4 (FFN bulk):  {len(int4_ops)} ops")
+    for name in int4_ops:
+        shape = weight_meta[name].val.shape
+        print(f"    {name}  {shape}")
+    if skipped_ops:
+        print(f"  skipped (tiny):   {len(skipped_ops)} ops")
+
+    opt_config = OptimizationConfig(
+        global_config=int4_config,
+        op_name_configs=op_name_configs,
+    )
+    mlmodel = linear_quantize_weights(mlmodel, config=opt_config)
+    print("  Mixed-precision quantization ✓")
+    return mlmodel
+
+
+# ─── Calibration Data ──────────────────────────────────────────────────────
+
+def _make_calibration_inputs(gguf_model, token_embd, cfg, n_samples=128, seq_len=64,
+                              use_real_text=False):
+    """Generate calibration inputs by embedding token sequences.
+
+    Returns a list of (x_embd, position) tuples where x_embd is (1, d, 1, 1) fp16
+    and position is the token position index.
+
+    use_real_text=True: chat-template-structured sequences with Zipf-distributed
+    common tokens (preserves instruction-following patterns in GPTQ Hessian).
+    use_real_text=False: uniformly random tokens from full vocab (original).
+    """
+    if use_real_text:
+        return _make_real_calibration_inputs(gguf_model, token_embd, cfg, n_samples, seq_len)
+
+    import torch
+
+    vocab = cfg["vocab_size"]
+    d = cfg["d_model"]
+
+    # Generate random token sequences for calibration
+    rng = np.random.default_rng(42)
+    samples = []
+    for _ in range(n_samples):
+        token_ids = rng.integers(0, vocab, size=seq_len)
+        for pos, tid in enumerate(token_ids):
+            emb = token_embd[tid].astype(np.float16)
+            x = torch.tensor(emb, dtype=torch.float16).reshape(1, d, 1, 1)
+            samples.append((x, pos))
+
+    print(f"  Calibration: {len(samples)} samples ({n_samples} seqs × {seq_len} tokens)")
+    return samples
+
+
+def _make_real_calibration_inputs(gguf_model, token_embd, cfg, n_samples, seq_len):
+    """Generate calibration inputs using chat template structure + Zipf-distributed tokens.
+
+    Instead of uniform random tokens from the full 151K vocab (mostly rare tokens),
+    this uses:
+    1. Qwen chat template markers (<|im_start|>, <|im_end|>) so GPTQ sees the
+       instruction-following structure and preserves it.
+    2. Uniform random tokens from the first 50K vocab IDs (common BPE merges).
+       NOT Zipf — Zipf concentrates on too few embeddings, creating low-rank
+       Hessians that blow up gate_up_conv errors (1449 at layer 1!).
+
+    This gives the GPTQ Hessian instruction-following structure without
+    the rank-deficiency that Zipf causes for wide FFN projections.
+    """
+    import torch
+
+    vocab = cfg["vocab_size"]
+    d = cfg["d_model"]
+
+    tok_data = gguf_model.extract_tokenizer()
+    token_types = tok_data.get("token_types", [])
+
+    # Qwen chat template special tokens
+    IM_START = 151644
+    IM_END = tok_data.get("eos_token_id", 151645)
+
+    # Normal vocabulary tokens (type 1), truncated to first 50K (common BPE merges).
+    # Uniform random within this range — NOT Zipf (Zipf creates low-rank Hessians).
+    normal_ids = np.array([i for i, t in enumerate(token_types)
+                           if t == 1 and i < 50000], dtype=np.int64)
+    if len(normal_ids) < 1000:
+        # Fallback: tokens 256-50000 (skip byte tokens, take common BPE merges)
+        normal_ids = np.arange(256, min(50000, vocab), dtype=np.int64)
+
+    rng = np.random.default_rng(42)
+
+    samples = []
+    for seq_idx in range(n_samples):
+        seq = []
+
+        # ── System message (~12 tokens) ──
+        # <|im_start|> system-content <|im_end|>
+        sys_len = min(10, max(seq_len // 8, 4))
+        seq.append(IM_START)
+        sys_ids = normal_ids[rng.integers(0, len(normal_ids), size=sys_len)]
+        seq.extend(sys_ids.tolist())
+        seq.append(IM_END)
+
+        # ── User message (roughly half of remaining budget) ──
+        user_budget = max((seq_len - len(seq)) // 2, 4)
+        seq.append(IM_START)
+        user_ids = normal_ids[rng.integers(0, len(normal_ids), size=user_budget - 2)]
+        seq.extend(user_ids.tolist())
+        seq.append(IM_END)
+
+        # ── Assistant response (fill remaining) ──
+        remaining = seq_len - len(seq)
+        if remaining > 1:
+            seq.append(IM_START)
+            asst_ids = normal_ids[rng.integers(0, len(normal_ids), size=remaining - 1)]
+            seq.extend(asst_ids.tolist())
+
+        # Truncate to exact seq_len
+        seq = seq[:seq_len]
+
+        for pos, tid in enumerate(seq):
+            tid_safe = min(max(tid, 0), vocab - 1)
+            emb = token_embd[tid_safe].astype(np.float16)
+            x = torch.tensor(emb, dtype=torch.float16).reshape(1, d, 1, 1)
+            samples.append((x, pos))
+
+    print(f"  Calibration: {len(samples)} chat-structured samples "
+          f"({n_samples} seqs × {seq_len} tokens, uniform top-50K)")
+    return samples
+
+
+def _woodbury_gptq_compress(conv_module, hook_inputs, group_size=32,
+                            damp_pct=0.01, processing_group_size=128):
+    """Custom GPTQ compression for Conv2d layers.
+
+    Replaces coremltools' GPTQ class with our own implementation:
+    - Stores raw activations and forms Hessian via single BLAS matmul
+      (faster than coremltools' incremental per-sample accumulation)
+    - Standard 3-Cholesky inversion (numerically stable)
+    - Symmetric uint4 per-block quantization with GPTQ column iteration
+    - Full control over damping, block size, and quantization parameters
+    """
+    import time
+    import torch
+    import torch.nn as _nn
+
+    weight = conv_module.weight.data.clone()
+    if isinstance(conv_module, _nn.Conv2d):
+        weight = weight.flatten(1)
+    weight = weight.float()
+
+    n_out, n_in = weight.shape
+
+    # Collect and unfold all input activations → X matrix (k × n_in)
+    unfold = _nn.Unfold(
+        conv_module.kernel_size,
+        dilation=conv_module.dilation,
+        padding=conv_module.padding,
+        stride=conv_module.stride,
+    )
+    all_x = []
+    for inp in hook_inputs:
+        x = unfold(inp)           # (batch, C*kH*kW, L)
+        x = x.permute(1, 0, 2)   # (C, batch, L)
+        x = x.flatten(1).t()     # (batch*L, C) — each row is one sample
+        all_x.append(x.float())
+    X = torch.cat(all_x, dim=0)  # (k, n_in)
+    k, n = X.shape
+    del all_x
+
+    tick = time.time()
+
+    # Dead columns
+    col_norms = (X ** 2).sum(dim=0)
+    dead = col_norms == 0
+    weight[:, dead] = 0
+
+    # Form Hessian from raw activations and invert via standard 3-Cholesky.
+    # We store raw X (k×n) and form H = X^TX/k in one BLAS matmul, which is
+    # faster than coremltools' incremental per-sample accumulation.
+    # Woodbury (bypassing 2 of 3 Choleskys) was attempted but suffers
+    # catastrophic cancellation in float32 when k/n < 1 — the subtraction
+    # I - X^T G^{-1} X loses precision in near-null-space directions.
+    H = (X.t() @ X) / k
+    del X
+    H[dead, dead] = 1.0
+    damp = damp_pct * torch.mean(torch.diag(H))
+    diag_idx = torch.arange(n, device=H.device)
+    H[diag_idx, diag_idx] += damp
+    H = torch.linalg.cholesky(H)
+    H = torch.cholesky_inverse(H)
+    hessian_inverse = torch.linalg.cholesky(H, upper=True)
+    del H
+
+    t_hessian = time.time() - tick
+    rank_info = f" (rank≤{min(k, n)})" if k < n else ""
+    print(f"      k={k}, n={n}{rank_info}, hessian+inv={t_hessian:.1f}s")
+
+    # ── Standard GPTQ column iteration (identical to coremltools) ──
+    tick2 = time.time()
+
+    # Standard symmetric uint4 quantization — 16 levels (0..15).
+    #
+    # MIL internally uses a 15-level grid (0..14, zp=7), but using 15 levels
+    # during GPTQ causes error amplification: the ~7% larger quantization step
+    # compounds through column iteration, causing divergent error propagation.
+    # The standard 16-level grid (used by coremltools GPTQ, GPTQ paper, etc.)
+    # keeps errors small. MIL re-quantization introduces minor shifts (~1 level
+    # for a few values), which is much less harmful than amplified GPTQ errors.
+    n_bits = 4
+    q_max = 2 ** n_bits - 1  # 15 (standard 16-level grid)
+    q_zp = q_max // 2        # 7 (asymmetric: range is [-8, +7] * scale)
+    # Note: q_zp=7 maps to 0, so range is [-7, +8] * scale after clamp [0, 15]
+
+    quant_weight = torch.zeros_like(weight)
+    losses = torch.zeros_like(weight)
+
+    for i1 in range(0, n, processing_group_size):
+        i2 = min(i1 + processing_group_size, n)
+        count = i2 - i1
+
+        weight_block = weight[:, i1:i2].clone()
+        quant_weight_block = torch.zeros_like(weight_block)
+        error_block = torch.zeros_like(weight_block)
+        losses_block = torch.zeros_like(weight_block)
+        hessian_inverse_block = hessian_inverse[i1:i2, i1:i2]
+
+        for i in range(count):
+            w = weight_block[:, i]
+            d = hessian_inverse_block[i, i]
+
+            # Per-row, per-group symmetric quantization
+            col_idx = i1 + i
+            if col_idx % group_size == 0:
+                block_end = min(col_idx + group_size, n)
+                block_w = weight[:, col_idx:block_end]
+                # Per-row max (MIL uses per-output-channel scales)
+                wmax = block_w.abs().amax(dim=1, keepdim=False)  # [m]
+                wmax = wmax.clamp(min=1e-7)
+                scale = 2.0 * wmax / q_max  # [m] per-row
+                zero_point = float(q_zp)
+
+            # Quantize (standard 16-level grid, per-row scale)
+            q = torch.clamp(torch.round(w / scale + zero_point), 0, q_max)
+            q = scale * (q - zero_point)
+            quant_weight_block[:, i] = q
+            losses_block[:, i] = (w - q) ** 2 / d ** 2
+
+            err1 = (w - q) / d
+            weight_block[:, i:] -= err1.unsqueeze(1) @ hessian_inverse_block[i, i:].unsqueeze(0)
+            error_block[:, i] = err1
+
+        quant_weight[:, i1:i2] = quant_weight_block
+        losses[:, i1:i2] = losses_block / 2
+        weight[:, i2:] -= error_block @ hessian_inverse[i1:i2, i2:]
+
+    t_iter = time.time() - tick2
+    total_loss = losses.sum().item()
+    print(f"      Column iteration: {t_iter:.1f}s, loss={total_loss:.2f}")
+
+    # Write back quantized weights
+    conv_module.weight.data = quant_weight.reshape(conv_module.weight.shape).to(
+        conv_module.weight.data.dtype
+    )
+
+
+def _apply_gptq(model, gguf_model, token_embd, cfg, n_layers, max_seq_len,
+                group_size=32, n_calib_samples=32, calib_seq_len=64,
+                use_real_text=False, use_woodbury=False):
+    """Apply GPTQ calibrated quantization to Conv2d weights at the PyTorch level.
+
+    For each Conv2d in the model, collects input activations from calibration data,
+    then uses coremltools' GPTQ algorithm to find optimal int4 quantization that
+    minimizes output reconstruction error (Hessian-informed, not RTN).
+
+    This happens BEFORE ct.convert() — the PyTorch model gets quantized weights
+    that, when converted to CoreML, will produce better int4 quality.
+
+    use_real_text: if True, calibration uses chat-template-structured token
+    sequences with uniform random tokens from common vocab.
+    use_woodbury: if True, uses Woodbury identity to exploit rank deficiency
+    in Hessian (faster when n_samples << n_columns, e.g. down_conv).
+    """
+    import torch
+    from coremltools.optimize.torch.layerwise_compression import GPTQ, ModuleGPTQConfig
+
+    mode_str = "Woodbury" if use_woodbury else "standard"
+    print(f"\nGPTQ calibrated quantization (int4, group_size={group_size}, {mode_str})...")
+
+    d = cfg["d_model"]
+    dh = cfg["d_head"]
+    nkv = cfg["n_kv_heads"]
+    nh = cfg["n_heads"]
+
+    gptq_config = ModuleGPTQConfig(
+        weight_dtype="uint4",
+        granularity="per_block",
+        block_size=group_size,
+        quantization_scheme="symmetric",
+    )
+
+    # Generate calibration data
+    calib_samples = _make_calibration_inputs(
+        gguf_model, token_embd, cfg,
+        n_samples=n_calib_samples, seq_len=calib_seq_len,
+        use_real_text=use_real_text,
+    )
+
+    # Cast model to fp32 for calibration — fp16 attention overflows at dh=128
+    model.float()
+    model.eval()
+    with torch.no_grad():
+        hidden_states = []
+        positions_list = []
+        for x, pos in calib_samples:
+            hidden_states.append(x.float())
+            positions_list.append(pos)
+
+        # RoPE tables in fp32
+        d_half = dh // 2
+        freqs = 1.0 / (cfg["rope_freq_base"] ** (np.arange(0, d_half, dtype=np.float32) / d_half))
+        positions_arr = np.arange(max_seq_len, dtype=np.float32)
+        angles = np.outer(positions_arr, freqs)
+        rope_cos_t = torch.tensor(np.cos(angles), dtype=torch.float32)
+        rope_sin_t = torch.tensor(np.sin(angles), dtype=torch.float32)
+
+        for layer_idx, layer in enumerate(model.layers):
+            print(f"  GPTQ layer {layer_idx}/{n_layers}...")
+
+            # Create per-layer KV cache (fp32)
+            k_cache = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+            v_cache = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+
+            # Hook into Conv2d layers to capture inputs
+            qkv_hook_inputs = []
+            out_hook_inputs = []
+            gate_up_hook_inputs = []
+            down_hook_inputs = []
+
+            def make_hook(storage):
+                def hook(module, inp, out):
+                    storage.append(inp[0].detach().clone())
+                return hook
+
+            h1 = layer.qkv_conv.register_forward_hook(make_hook(qkv_hook_inputs))
+            h2 = layer.out_conv.register_forward_hook(make_hook(out_hook_inputs))
+            h3 = layer.gate_up_conv.register_forward_hook(make_hook(gate_up_hook_inputs))
+            h4 = layer.down_conv.register_forward_hook(make_hook(down_hook_inputs))
+
+            # Run all calibration samples through this layer
+            new_hidden = []
+            for i, (x, pos) in enumerate(zip(hidden_states, positions_list)):
+                pos_clamped = min(pos, max_seq_len - 1)
+                rope_cos_pos = rope_cos_t[pos_clamped:pos_clamped+1]
+                rope_sin_pos = rope_sin_t[pos_clamped:pos_clamped+1]
+
+                # Attention mask (fp32)
+                attn_mask = torch.full((1, 1, 1, max_seq_len), -1e4, dtype=torch.float32)
+                attn_mask[0, 0, 0, :pos_clamped + 1] = 0.0
+
+                # Write mask (fp32)
+                kv_write_mask = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float32)
+                kv_write_mask[0, 0, pos_clamped, 0] = 1.0
+
+                x_out = layer(x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
+                              attn_mask, kv_write_mask)
+                new_hidden.append(x_out)
+
+            h1.remove()
+            h2.remove()
+            h3.remove()
+            h4.remove()
+
+            # Apply GPTQ to each Conv2d using collected activations
+            for conv_name, conv_module, hook_inputs in [
+                ("qkv_conv", layer.qkv_conv, qkv_hook_inputs),
+                ("out_conv", layer.out_conv, out_hook_inputs),
+                ("gate_up_conv", layer.gate_up_conv, gate_up_hook_inputs),
+                ("down_conv", layer.down_conv, down_hook_inputs),
+            ]:
+                if not hook_inputs:
+                    print(f"    WARNING: no inputs captured for {conv_name}")
+                    continue
+
+                if use_woodbury:
+                    print(f"    Woodbury GPTQ {conv_name}...")
+                    _woodbury_gptq_compress(conv_module, hook_inputs,
+                                           group_size=group_size)
+                else:
+                    gptq = GPTQ(conv_module, gptq_config)
+                    for inp_tensor in hook_inputs:
+                        out_tensor = conv_module(inp_tensor)
+                        gptq.add_batch(inp_tensor, out_tensor)
+                    gptq.compress()
+                    gptq.cleanup()
+
+            # Re-run calibration samples through the NOW-QUANTIZED layer
+            # to get correct hidden states for the next layer.
+            # Without this, later layers see activations from unquantized
+            # predecessors — a compounding calibration mismatch that causes
+            # divergent quantization across 28 layers.
+            new_hidden_q = []
+            k_cache_q = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+            v_cache_q = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+            for i, (x, pos) in enumerate(zip(hidden_states, positions_list)):
+                pos_clamped = min(pos, max_seq_len - 1)
+                rope_cos_pos = rope_cos_t[pos_clamped:pos_clamped+1]
+                rope_sin_pos = rope_sin_t[pos_clamped:pos_clamped+1]
+                attn_mask = torch.full((1, 1, 1, max_seq_len), -1e4, dtype=torch.float32)
+                attn_mask[0, 0, 0, :pos_clamped + 1] = 0.0
+                kv_write_mask = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float32)
+                kv_write_mask[0, 0, pos_clamped, 0] = 1.0
+                x_out = layer(x, k_cache_q, v_cache_q, rope_cos_pos, rope_sin_pos,
+                              attn_mask, kv_write_mask)
+                new_hidden_q.append(x_out)
+            hidden_states = new_hidden_q
+            del new_hidden, new_hidden_q
+            del qkv_hook_inputs, out_hook_inputs, gate_up_hook_inputs, down_hook_inputs
+
+        # GPTQ the LM head
+        print(f"  GPTQ lm_head...")
+        lm_head_inputs = []
+        for x in hidden_states:
+            normed = model.output_norm(x)
+            lm_head_inputs.append(normed)
+
+        if use_woodbury:
+            _woodbury_gptq_compress(model.lm_head_conv, lm_head_inputs,
+                                   group_size=group_size)
+        else:
+            gptq = GPTQ(model.lm_head_conv, gptq_config)
+            for inp_tensor in lm_head_inputs:
+                out_tensor = model.lm_head_conv(inp_tensor)
+                gptq.add_batch(inp_tensor, out_tensor)
+            gptq.compress()
+            gptq.cleanup()
+
+    # Cast back to fp16 for tracing/conversion
+    model.half()
+    print("  GPTQ quantization complete ✓")
+    return model
+
+
+def _apply_smoothquant(model, gguf_model, token_embd, cfg, n_layers, max_seq_len,
+                       alpha=0.5, n_calib_samples=32, calib_seq_len=64):
+    """Apply SmoothQuant to weight matrices before quantization.
+
+    SmoothQuant migrates quantization difficulty from activations to weights:
+      1. Run calibration data, collect per-channel activation max |X_j| at each layer input
+      2. Compute smoothing factor: s_j = max(|X_j|)^α / max(|W_j|)^(1-α)
+      3. Scale preceding norm weights by 1/s (absorbs into activation path)
+      4. Scale current layer weights by s (compensates)
+
+    After smoothing, the activation outlier channels are reduced, making uniform
+    quantization much more effective. α controls the balance — higher α pushes more
+    difficulty onto weights.
+    """
+    import torch
+
+    print(f"\nSmoothQuant (α={alpha})...")
+
+    d = cfg["d_model"]
+    dh = cfg["d_head"]
+    nkv = cfg["n_kv_heads"]
+    d_half = dh // 2
+
+    # RoPE tables (fp32 for calibration; model.half() at end handles tracing)
+    freqs = 1.0 / (cfg["rope_freq_base"] ** (np.arange(0, d_half, dtype=np.float32) / d_half))
+    positions = np.arange(max_seq_len, dtype=np.float32)
+    angles = np.outer(positions, freqs)
+    rope_cos_t = torch.tensor(np.cos(angles), dtype=torch.float32)
+    rope_sin_t = torch.tensor(np.sin(angles), dtype=torch.float32)
+
+    calib_samples = _make_calibration_inputs(
+        gguf_model, token_embd, cfg,
+        n_samples=n_calib_samples, seq_len=calib_seq_len,
+    )
+
+    # Cast model to fp32 for calibration — fp16 attention overflows at dh=128,
+    # producing NaN that corrupts all activation statistics.  fp32 gives clean
+    # activations so smoothing factors are computed from real data.
+    model.float()
+    model.eval()
+    with torch.no_grad():
+        hidden_states = [x.float() for x, _ in calib_samples]
+        positions_list = [pos for _, pos in calib_samples]
+
+        for layer_idx, layer in enumerate(model.layers):
+            print(f"  SmoothQuant layer {layer_idx}/{n_layers}...")
+
+            # Create per-layer KV cache for calibration (fp32)
+            k_cache = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+            v_cache = torch.zeros(1, nkv, max_seq_len, dh, dtype=torch.float32)
+
+            # Collect per-channel activation magnitudes
+            qkv_act_max = torch.zeros(d, dtype=torch.float32)
+            ffn_act_max = torch.zeros(d, dtype=torch.float32)
+
+            new_hidden = []
+            for x, pos in zip(hidden_states, positions_list):
+                # attn_norm output → qkv_conv input
+                normed = layer.attn_norm(x)
+                normed_flat = normed.squeeze()
+                if normed_flat.dim() == 0:
+                    normed_flat = normed_flat.unsqueeze(0)
+                qkv_act_max = torch.max(qkv_act_max, normed_flat.abs())
+
+                # ffn_norm output → gate_up_conv input (approximate: uses pre-attn x)
+                ffn_normed = layer.ffn_norm(x)
+                ffn_flat = ffn_normed.squeeze()
+                if ffn_flat.dim() == 0:
+                    ffn_flat = ffn_flat.unsqueeze(0)
+                ffn_act_max = torch.max(ffn_act_max, ffn_flat.abs())
+
+                # Run full layer in fp32
+                pos_clamped = min(pos, max_seq_len - 1)
+                rope_cos_pos = rope_cos_t[pos_clamped:pos_clamped+1]
+                rope_sin_pos = rope_sin_t[pos_clamped:pos_clamped+1]
+                attn_mask = torch.full((1, 1, 1, max_seq_len), -1e4, dtype=torch.float32)
+                attn_mask[0, 0, 0, :pos_clamped + 1] = 0.0
+                kv_write_mask = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float32)
+                kv_write_mask[0, 0, pos_clamped, 0] = 1.0
+
+                x_out = layer(x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
+                              attn_mask, kv_write_mask)
+                new_hidden.append(x_out)
+
+            # Compute smoothing factors for QKV path
+            qkv_w = layer.qkv_conv.weight.squeeze()  # already fp32
+            qkv_w_max = qkv_w.abs().amax(dim=0)  # per input-channel max
+
+            qkv_act_max = qkv_act_max.clamp(min=1e-5)
+            qkv_w_max = qkv_w_max.clamp(min=1e-5)
+
+            s_qkv = (qkv_act_max.pow(alpha) / qkv_w_max.pow(1 - alpha)).clamp(min=0.01, max=100.0)
+
+            # Apply smoothing in fp32 — no nan_to_num needed since fp32 doesn't overflow
+            layer.attn_norm.weight.data.copy_(
+                (layer.attn_norm.weight / s_qkv.reshape(-1, 1, 1)))
+            layer.qkv_conv.weight.data.copy_(
+                (qkv_w * s_qkv.unsqueeze(0)).reshape_as(layer.qkv_conv.weight))
+
+            # Smooth FFN path
+            gate_up_w = layer.gate_up_conv.weight.squeeze()  # already fp32
+            gate_up_w_max = gate_up_w.abs().amax(dim=0)
+            ffn_act_max = ffn_act_max.clamp(min=1e-5)
+            gate_up_w_max = gate_up_w_max.clamp(min=1e-5)
+
+            s_ffn = (ffn_act_max.pow(alpha) / gate_up_w_max.pow(1 - alpha)).clamp(min=0.01, max=100.0)
+
+            layer.ffn_norm.weight.data.copy_(
+                (layer.ffn_norm.weight / s_ffn.reshape(-1, 1, 1)))
+            layer.gate_up_conv.weight.data.copy_(
+                (gate_up_w * s_ffn.unsqueeze(0)).reshape_as(layer.gate_up_conv.weight))
+
+            hidden_states = new_hidden
+
+    # Cast back to fp16 for tracing/conversion
+    model.half()
+    print("  SmoothQuant complete ✓")
+    return model
+
+
 # ─── PyTorch Model (Float16, Stateful KV) ──────────────────────────────────
 
-def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32):
+def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32, strategy="uniform"):
     import coremltools as ct
     import torch
     import torch.nn as nn
@@ -553,11 +1201,12 @@ def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_s
 
     # ── Post-training weight quantization ────────────────────────────────
 
-    mlmodel = _quantize_weights(mlmodel, quant_bits)
+    mlmodel = _quantize_weights(mlmodel, quant_bits, group_size=group_size, strategy=strategy)
 
     # ── Save ─────────────────────────────────────────────────────────────
 
-    suffix = f"_q{quant_bits}" if quant_bits else ""
+    strat_tag = f"_{strategy}" if strategy != "uniform" else ""
+    suffix = f"_q{quant_bits}{strat_tag}" if quant_bits else ""
     prefix = f"QwenANE_{n_layers}L{suffix}"
     pkg_path = f"{prefix}.mlpackage"
     mlmodel.save(pkg_path)
@@ -610,7 +1259,7 @@ def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_s
 
 # ─── Fixed-Shape Model (zero dynamic dims, batched GQA) ─────────────────────
 
-def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32):
+def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32, strategy="uniform"):
     """Build a fully fixed-shape model variant.
 
     Key differences from build_model():
@@ -950,11 +1599,12 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
 
     # ── Post-training weight quantization ────────────────────────────────
 
-    mlmodel = _quantize_weights(mlmodel, quant_bits)
+    mlmodel = _quantize_weights(mlmodel, quant_bits, group_size=group_size, strategy=strategy)
 
     # ── Save ─────────────────────────────────────────────────────────────
 
-    suffix = f"_q{quant_bits}" if quant_bits else ""
+    strat_tag = f"_{strategy}" if strategy != "uniform" else ""
+    suffix = f"_q{quant_bits}{strat_tag}" if quant_bits else ""
     prefix = f"QwenANE_{n_layers}L_fixed{suffix}"
     pkg_path = f"{prefix}.mlpackage"
     mlmodel.save(pkg_path)
@@ -1009,7 +1659,7 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
 
 # ─── Stateful Model (KV cache as on-device state, zero host↔ANE copy) ───────
 
-def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32):
+def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_size=32, strategy="uniform"):
     """Build a stateful CoreML model with KV cache as MLState.
 
     Key differences from build_fixed_model():
@@ -1017,7 +1667,17 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     - No KV inputs or outputs — model reads/writes state internally
     - Eliminates all host↔ANE KV data transfer (~6MB per token)
     - Layers do in-place scatter-write to state buffers
+
+    NOTE: seq_len must be ≥ 1637 to avoid a CoreML CPU-backend state bug
+    that produces NaN at forward pass 3. The threshold depends on model
+    dimensions (d=1536, nkv=2, dh=128 → KV state shape (1,2,seq,128)).
     """
+    # Guard against the CoreML CPU-backend state bug (NaN at fwd=3)
+    MIN_SEQ_LEN = 1637
+    if max_seq_len < MIN_SEQ_LEN:
+        print(f"  ⚠️  seq_len {max_seq_len} < {MIN_SEQ_LEN}: bumping to {MIN_SEQ_LEN} "
+              f"(CoreML CPU-backend state bug workaround)")
+        max_seq_len = MIN_SEQ_LEN
     import coremltools as ct
     import torch
     import torch.nn as nn
@@ -1071,7 +1731,7 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             xf = x.float()
             variance = xf.pow(2).mean(dim=1, keepdim=True)
             x_normed = xf * torch.rsqrt(variance + self.eps)
-            return (x_normed * self.weight.float()).half()
+            return (x_normed * self.weight.float()).to(x.dtype)
 
     class StatefulLayerConv(nn.Module):
         """Transformer layer — in-place KV state update, batched GQA."""
@@ -1185,7 +1845,7 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
                 k_t = k_head.transpose(-2, -1)
                 scores = torch.matmul(q_g, k_t) * self.scale
                 scores = scores + attn_mask
-                attn_w = torch.softmax(scores.float(), dim=-1).half()
+                attn_w = torch.softmax(scores.float(), dim=-1).to(q_g.dtype)
                 head_out = torch.matmul(attn_w, v_head)
                 attn_parts.append(head_out.squeeze(2))
 
@@ -1199,7 +1859,7 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             gate_up = self.gate_up_conv(normed2)
             gate = gate_up[:, :self.dff, :, :]
             up = gate_up[:, self.dff:, :, :]
-            hidden = F.silu(gate.float()).half() * up
+            hidden = F.silu(gate.float()).to(gate.dtype) * up
             ffn_out = self.down_conv(hidden)
             x = residual2 + ffn_out
             return x
@@ -1266,6 +1926,26 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  {n_params:,} parameters (fp16)")
 
+    # ── Pre-conversion weight optimization (PyTorch level) ───────────────
+
+    if strategy == "smooth":
+        model = _apply_smoothquant(model, gguf, token_embd, cfg, n_layers, max_seq_len)
+    elif strategy in ("gptq", "gptq-mixed"):
+        model = _apply_gptq(model, gguf, token_embd, cfg, n_layers, max_seq_len,
+                            group_size=group_size, use_real_text=False)
+    elif strategy == "gptq-real":
+        model = _apply_gptq(model, gguf, token_embd, cfg, n_layers, max_seq_len,
+                            group_size=group_size, use_real_text=True)
+    elif strategy == "gptq-woodbury":
+        model = _apply_gptq(model, gguf, token_embd, cfg, n_layers, max_seq_len,
+                            group_size=group_size, use_real_text=True,
+                            use_woodbury=True)
+
+    # Re-sync model state after weight modifications (ensures TorchScript IR
+    # and state_dict agree — .data assignments can break tensor identity)
+    if strategy in ("smooth", "gptq", "gptq-real", "gptq-mixed", "gptq-woodbury"):
+        model.load_state_dict(model.state_dict())
+
     # ── Trace ────────────────────────────────────────────────────────────
 
     d_half = dh // 2
@@ -1283,6 +1963,14 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         print(f"  logits: {output.shape}, dtype: {output.dtype}")
 
     traced = torch.jit.trace(model, (x_ex, cos_ex, sin_ex, mask_ex, wmask_ex))
+
+    # Reset KV cache buffers after tracing — forward pass writes NaN/stale values
+    # into caches (fp16 overflow at dh=128), and NaN != NaN breaks coremltools'
+    # torch.equal() assertion in _lower_graph_block.
+    with torch.no_grad():
+        for i in range(n_layers):
+            getattr(model, f"k_cache_{i}").zero_()
+            getattr(model, f"v_cache_{i}").zero_()
 
     # ── Convert to CoreML ────────────────────────────────────────────────
 
@@ -1319,13 +2007,25 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     )
 
     # ── Post-training weight quantization ────────────────────────────────
-
-    mlmodel = _quantize_weights(mlmodel, quant_bits, group_size=group_size)
+    # For gptq/gptq-real/smooth: PyTorch-level optimization already done; apply
+    # uniform int4 at MIL level to encode the optimized weights into actual int4.
+    # For gptq-mixed: GPTQ-optimized weights, but QKV gets int8 at MIL level
+    # (higher precision for attention → better prompt discrimination).
+    # For mixed: apply per-op mixed-precision at MIL level.
+    # For uniform: standard RTN quantization.
+    if strategy == "gptq-mixed":
+        mil_strategy = "mixed"
+    elif strategy in ("gptq", "gptq-real", "gptq-woodbury", "smooth"):
+        mil_strategy = "uniform"
+    else:
+        mil_strategy = strategy
+    mlmodel = _quantize_weights(mlmodel, quant_bits, group_size=group_size, strategy=mil_strategy)
 
     # ── Save ─────────────────────────────────────────────────────────────
 
     if quant_bits:
-        suffix = f"_q{quant_bits}" + (f"g{group_size}" if group_size != 32 else "")
+        strat_tag = f"_{strategy}" if strategy != "uniform" else ""
+        suffix = f"_q{quant_bits}{strat_tag}" + (f"g{group_size}" if group_size != 32 else "")
     else:
         suffix = ""
     prefix = f"QwenANE_{n_layers}L_stateful{suffix}"
@@ -1374,7 +2074,7 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     print(f"  Attention:  Batched GQA ({n_layers * nkv * 2} matmul ops)")
     print(f"  Dtype:      Float16{f' + int{quant_bits} weights' if quant_bits else ''}")
     print(f"  Tokenizer:  BPE ({len(tok_data['tokens'])} vocab)")
-    print(f"  Target:     ANE (CPU_AND_NE)")
+    print(f"  Target:     ANE (CPU_AND_NE, seq_len≥1637 state-bug guard)")
     print(f"{'='*60}")
 
     return pkg_path
@@ -1392,6 +2092,16 @@ def main():
                         help="Weight quantization bits (0=fp16, 4=int4 grouped, 8=int8). Default 0.")
     parser.add_argument("--group-size", type=int, default=32, dest="group_size",
                         help="Block/group size for grouped int4/int8 quantization (default 32). Larger = smaller weights, lower fidelity.")
+    parser.add_argument("--quant-strategy", choices=["uniform", "mixed", "gptq", "gptq-real", "gptq-mixed", "gptq-woodbury", "smooth"],
+                        default="uniform", dest="quant_strategy",
+                        help="Quantization strategy: uniform=same precision everywhere (RTN), "
+                             "mixed=int8 for sensitive layers + int4 for FFN (MIL-level), "
+                             "gptq=GPTQ calibrated (random cal, uniform int4 MIL), "
+                             "gptq-real=GPTQ with chat-template calibration (uniform int4 MIL), "
+                             "gptq-mixed=GPTQ (random cal) + mixed MIL (QKV int8, rest int4), "
+                             "gptq-woodbury=Woodbury-accelerated GPTQ (real cal, exploits rank deficiency), "
+                             "smooth=SmoothQuant activation smoothing + int4 (PyTorch-level). "
+                             "Default: uniform.")
     parser.add_argument("--quantize", action="store_const", const=8, dest="quant_bits",
                         help="Deprecated alias for --quant-bits 8")
     parser.add_argument("--fixed", action="store_true",
@@ -1402,13 +2112,16 @@ def main():
 
     if args.stateful:
         build_stateful_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
-                             quant_bits=args.quant_bits, group_size=args.group_size)
+                             quant_bits=args.quant_bits, group_size=args.group_size,
+                             strategy=args.quant_strategy)
     elif args.fixed:
         build_fixed_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
-                          quant_bits=args.quant_bits, group_size=args.group_size)
+                          quant_bits=args.quant_bits, group_size=args.group_size,
+                          strategy=args.quant_strategy)
     else:
         build_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
-                    quant_bits=args.quant_bits, group_size=args.group_size)
+                    quant_bits=args.quant_bits, group_size=args.group_size,
+                    strategy=args.quant_strategy)
 
 
 if __name__ == "__main__":

@@ -430,7 +430,10 @@ func main() throws {
     }
 
     let mlConfig = MLModelConfiguration()
-    mlConfig.computeUnits = .cpuAndNeuralEngine
+    // .all is required for stateful models — CoreML's CPU/NE backend has a
+    // state-handling bug that produces NaN or garbled output regardless of
+    // seq_len.  .all routes state ops through the GPU path which is correct.
+    mlConfig.computeUnits = .all
     let model = try MLModel(contentsOf: modelURL, configuration: mlConfig)
 
     // ═══════════════════════════════════════════════════════════════════
