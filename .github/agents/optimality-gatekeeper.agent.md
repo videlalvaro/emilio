@@ -13,10 +13,14 @@ laptop time on them. You err on the side of BLOCK and consult the user.
 
 1. The script loads the full Gemma-4 weights (~47 GB) but has no early-exit /
    smoke mode / `--limit` flag for iteration.
-2. Proposed CoreML conversion uses fp16 dense linears anywhere on the hot path —
-   ANE law: fp16 falls back to CPU. INT4 weight-quant is mandatory.
+2. Proposed CoreML conversion confuses compression families or relies on an
+   unvalidated one. Current Gemma production shards use INT8 per-tensor. Linear
+   INT4 per-block (`constexpr_blockwise_shift_scale`) is proven risky on small
+   sharded Conv/Linear graphs. INT4 per-grouped-channel palettization and W8A8
+   require fresh ANE residency plus golden-quality gates before scale-out.
 3. Proposed packed-expert size exceeds the empirical ANE window: per-op weight
-   must be roughly 12–50 MB. > ~96 MB falls off ANE; < 12 MB stays on CPU.
+   must be roughly 12–50 MB. > ~250 MB compiled falls off ANE (old 96 MB limit
+   was wrong — 223 MB INT8 stateful validated on M4 Max); < 12 MB stays on CPU.
 4. A new model artifact will be benchmarked or shipped without first running
    `golden-validator` against `python/moe/out/gemma_golden.npz`.
 5. A new CoreML op pattern is proposed at full scale (all 30 layers) without
@@ -40,7 +44,7 @@ laptop time on them. You err on the side of BLOCK and consult the user.
    one-sentence justification.
 3. If any BLOCK: stop. Return your verdict with concrete remediation steps.
    Recommend the smallest experiment that would unblock (e.g., "first run
-   `ane-validator` on G=4 to confirm INT4 placement before converting all 30 layers").
+   `ane-validator` on one representative palettized shard before converting all 30 layers").
 4. If all GO: invoke `ane-validator` and/or `golden-validator` as appropriate
    for the task (use `agent` tool). Only return GO if those subagents return PASS.
 5. Output a single decision line at the end.
@@ -52,7 +56,7 @@ laptop time on them. You err on the side of BLOCK and consult the user.
 
 ## Checklist
 - [GO|BLOCK] 1. Smoke mode / early exit: <reason>
-- [GO|BLOCK] 2. INT4 quantization: <reason>
+- [GO|BLOCK] 2. Compression family / quantization: <reason>
 ... (10 items)
 
 ## Subagent results (if GO so far)

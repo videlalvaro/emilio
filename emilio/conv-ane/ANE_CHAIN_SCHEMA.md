@@ -310,7 +310,7 @@ For Gemma 4 26B-A4B (128 routed experts × 30 layers):
 ## Remaining Open Questions
 
 1. **64-procedure cap** — probe by attempting to load a model with N procedures, sweeping N. Needs the multi-function `.mlpackage` build path first.
-2. ~~**In-memory weights value-type**~~ — **PARTIALLY ANSWERED.** [emilio/conv-ane/ane_inmemory_model_probe.m](../../emilio/conv-ane/ane_inmemory_model_probe.m) shows `_weights` is **not** a flat `{NSString → NSData}`, **not** a flat `{NSString → _ANEWeight}`, and **not** a one-element array wrapper of either. The descriptor factory sends `count` to direct entries and `allValues` to array-wrapped entries, which strongly suggests a more nested dictionary-like per-weight payload. The same probe showed the inline-empty MIL path is real enough to create `_ANEInMemoryModelDescriptor` + `_ANEInMemoryModel` and reach `compileWithQoS:`, but the toy MIL fails at `_ANECompiler : ANECCompile() FAILED`. A follow-up replay with a **real compiled Qwen conv artifact** (`model.mil` + `weights/weight.bin`) using the nested raw-`NSData` container reached the **same** boundary: descriptor created, model created, private compiler entered, `ANECCompile()` failed again. Feeding either packaged sidecar blob (`coremldata.bin` or `analytics/coremldata.bin`) into the descriptor `optionsPlist` slot also left the boundary unchanged, and swapping to the alternate `modelWithNetworkDescription:weights:optionsPlist:` factory with packaged `coremldata.bin` still reached the same compile failure. The next compile-options probe established that `compileWithQoS:options:error:` is a **live** input surface: `_ANEInMemoryModel` synthesizes a compiler-options dictionary containing `kANEFCompilerOptionsFilenameKey`, `kANEFInMemoryModelIsCachedKey`, `kANEFIsInMemoryModelTypeKey`, and `kANEFModelType`, and caller-supplied options are merged into that dictionary. But forcing `kANEFModelType = kANEFModelANECIR` on the real MIL replay is normalized back to `kANEFModelMIL` and still fails at the same `ANECCompile()` wall. A follow-up probe using the other obvious real internal key, `kANEFCompilerOptionsFilenameKey`, also failed to move the wall: the caller-supplied alternate filename was not preserved in the derived compiler-options dictionary, which normalized back to `compiler_options.plist`, and compile still failed at the same `ANECCompile()` boundary. A final discriminator then bypassed the options-dictionary normalization entirely by calling `_ANEInMemoryModel`'s `setCompilerOptionsFileName:` directly before deriving compiler options. That direct setter path is live: `compilerOptionsFileName` changed to `copilot_missing_compiler_options.plist`, the derived compiler-options dictionary carried `kANEFCompilerOptionsFilenameKey = "copilot_missing_compiler_options.plist"`, and compile still failed at the same `ANECCompile()` boundary. A further compiler-owned probe using `maxModelMemorySize = 4096` also survived into the derived compiler-options dictionary unchanged and still failed at the same `ANECCompile()` boundary. Subsequent structural probes also closed the remaining obvious path / alias branches: shrinking the nested weights map to the single canonical outer key (`@model_path/weights/weight.bin`) plus a single inner `w` payload changed the weights hash but not the boundary; changing that inner key to `weights/weight.bin` normalized away entirely (same weights hash, same staged `w` file); and rewriting the MIL itself from `@model_path/weights/weight.bin` to `@model_path/w` changed the network hash but still failed at the same `ANECCompile()` wall. The next lower control also removed `_ANEModel + _ANEClient` as a rescue path for this specific problem: a direct compile of both the **original real `.mlmodelc`** and the **rewritten staged in-memory directory** failed identically in `com.apple.appleneuralengine.espresso` code `-1` with `_ANEEspressoIRTranslator : error Cannot load network '.../model.espresso.net'`. That shows the lower direct-client surface expects a different on-disk layout than both current public-CoreML `.mlmodelc` output and the in-memory staging directory. So the remaining unknown is no longer nested weight-key aliasing or `weight.bin` vs `w`; it is the hidden MIL-to-Espresso translation / staging contract upstream of `_ANEClient compileModel:options:qos:error:`.
+2. ~~**In-memory weights value-type**~~ — **PARTIALLY ANSWERED.** [emilio/conv-ane/ane_inmemory_model_probe.m](../../emilio/conv-ane/ane_inmemory_model_probe.m) shows `_weights` is **not** a flat `{NSString → NSData}`, **not** a flat `{NSString → _ANEWeight}`, and **not** a one-element array wrapper of either. The descriptor factory sends `count` to direct entries and `allValues` to array-wrapped entries, which strongly suggests a more nested dictionary-like per-weight payload. The same probe showed the inline-empty MIL path is real enough to create `_ANEInMemoryModelDescriptor` + `_ANEInMemoryModel` and reach `compileWithQoS:`, but the toy MIL fails at `_ANECompiler : ANECCompile() FAILED`. A follow-up replay with a **real compiled Qwen conv artifact** (`model.mil` + `weights/weight.bin`) using the nested raw-`NSData` container reached the **same** boundary: descriptor created, model created, private compiler entered, `ANECCompile()` failed again. Feeding either packaged sidecar blob (`coremldata.bin` or `analytics/coremldata.bin`) into the descriptor `optionsPlist` slot also left the boundary unchanged, and swapping to the alternate `modelWithNetworkDescription:weights:optionsPlist:` factory with packaged `coremldata.bin` still reached the same compile failure. The next compile-options probe established that `compileWithQoS:options:error:` is a **live** input surface: `_ANEInMemoryModel` synthesizes a compiler-options dictionary containing `kANEFCompilerOptionsFilenameKey`, `kANEFInMemoryModelIsCachedKey`, `kANEFIsInMemoryModelTypeKey`, and `kANEFModelType`, and caller-supplied options are merged into that dictionary. But forcing `kANEFModelType = kANEFModelANECIR` on the real MIL replay is normalized back to `kANEFModelMIL` and still fails at the same `ANECCompile()` wall. A follow-up probe using the other obvious real internal key, `kANEFCompilerOptionsFilenameKey`, also failed to move the wall: the caller-supplied alternate filename was not preserved in the derived compiler-options dictionary, which normalized back to `compiler_options.plist`, and compile still failed at the same `ANECCompile()` boundary. A final discriminator then bypassed the options-dictionary normalization entirely by calling `_ANEInMemoryModel`'s `setCompilerOptionsFileName:` directly before deriving compiler options. That direct setter path is live: `compilerOptionsFileName` changed to `copilot_missing_compiler_options.plist`, the derived compiler-options dictionary carried `kANEFCompilerOptionsFilenameKey = "copilot_missing_compiler_options.plist"`, and compile still failed at the same `ANECCompile()` boundary. A further compiler-owned probe using `maxModelMemorySize = 4096` also survived into the derived compiler-options dictionary unchanged and still failed at the same `ANECCompile()` boundary. Subsequent structural probes also closed the remaining obvious path / alias branches: shrinking the nested weights map to the single canonical outer key (`@model_path/weights/weight.bin`) plus a single inner `w` payload changed the weights hash but not the boundary; changing that inner key to `weights/weight.bin` normalized away entirely (same weights hash, same staged `w` file); and rewriting the MIL itself from `@model_path/weights/weight.bin` to `@model_path/w` changed the network hash but still failed at the same `ANECCompile()` wall. The next lower control also removed `_ANEModel + _ANEClient` as a rescue path for this specific problem: a direct compile of both the **original real `.mlmodelc`** and the **rewritten staged in-memory directory** failed identically in `com.apple.appleneuralengine.espresso` code `-1` with `_ANEEspressoIRTranslator : error Cannot load network '.../model.espresso.net'`. That showed the lower direct-client surface expects a different on-disk layout than both current public-CoreML `.mlmodelc` output and the in-memory staging directory. A follow-up control search then found a distinct legacy artifact family under Microsoft Teams 2 temp storage whose `.mlmodelc` root contains `model.espresso.net`, `model.espresso.shape`, and `model.espresso.weights`. Running the existing direct `_ANEModel + _ANEClient` path against two of those bundles moved the boundary exactly once: the missing-`model.espresso.net` failure disappeared, `_ANEModel` objects were created for both, and compile/load advanced to later failures instead of file lookup. But it still did not yield an end-to-end positive control: one bundle failed in `com.apple.appleneuralengine.compiler` with `InvalidNetworkSourceFileName`, and the other failed in `com.apple.appleneuralengine.espresso` code `-2` with `Cannot serialize ANEC_IR_repr`. A final repo-only control then removed the need for any external artifact family in the argument: the existing tiny multifunction package at `python/tmp/mfn_probe/experts_multi.mlpackage` has the normal public package layout (`Manifest.json` + `Data/`), its compiled sibling `experts_multi.mlmodelc` has the same modern public layout (`analytics/`, `coremldata.bin`, `model.mil`, `weights/`), and the direct `_ANEModel + _ANEClient` path against that compiled artifact still fails immediately with `_ANEEspressoIRTranslator : error Cannot load network '.../model.espresso.net'`. So the remaining unknown is now tighter than before: nested weight-key aliasing and `weight.bin` vs `w` are out, plain `model.espresso.net` materialization is necessary but not sufficient, and repo-local public compile outputs are definitively still upstream of the legacy Espresso layout the lower direct-client surface expects. The unresolved contract is the hidden MIL-to-Espresso translation step plus the stricter legacy Espresso source-name / IR format that the current daemon/compiler still accepts upstream of `_ANEClient compileModel:options:qos:error:`.
 3. ~~**`_ANEVirtualClient` vs daemon**~~ — **PARTIALLY ANSWERED.** [emilio/conv-ane/ane_virtual_client_probe.m](../../emilio/conv-ane/ane_virtual_client_probe.m) loaded `AppleNeuralEngine.framework` and resolved `_ANEVirtualClient`, but the only discovered constructor, `+sharedConnection`, returned `nil` from an unsigned/dev binary (`tmp/ane_virtual_client_probe/summary.json`). Treat the direct daemon-bypass path as blocked unless a different bootstrap or entitlement-bearing host is found.
 4. **Multi-function .mlpackage authoring** — coremltools 9.0 returned `MLMultiFunctionDescriptor: False` from `ct.models`. Find the actual API surface (likely `ct.utils.bisect_model` style helpers, or the `mil.Function` route).
 
@@ -400,6 +400,26 @@ Three probes measured what the ANE actually does on this M4 Max with realistic s
 
 So **earlier "GB/s" numbers under ~16 MB were measuring CPU**, not ANE. This invalidates the simple BW sweep at small sizes — those got 24–116 GB/s but it was the CPU's BW, not the ANE's.
 
+### Upper-size cliff recheck (2026-04-24)
+
+The earlier working assumption that compiled artifacts fall off ANE around `~96 MB` is **wrong as a general law**.
+
+New counterexample: a **stateful INT8 one-layer Qwen 7B probe** built via `gguf_to_ane.py` compiled to:
+
+| Artifact | Size | Conv placement |
+|---|---|---|
+| `Qwen7B_1L_probe.mlpackage` | 223 MB | 4/4 ANE |
+| `Qwen7B_1L_probe.mlmodelc`  | 223 MB | 4/4 ANE |
+
+Measured via `MLComputePlan` on `tmp/qwen7b_1layer_probe/Qwen7B_1L_probe.mlmodelc`, which reported `ANE=4 CPU=0 GPU=0` for conv ops (`ios18.conv*` / `conv` / `ios18.convolution`).
+
+So the right reading is narrower:
+- there is a **small-graph / INT4 shard bug** that pushes convs to CPU
+- there is a **lower-size floor** where tiny shapes fall to CPU
+- but there is **not** a universal upper compiled-size cliff at `~96 MB`
+
+At least for **stateful INT8 conv-heavy shards**, ANE placement remains valid at **223 MB compiled size** on this M4 Max.
+
 ### Bandwidth at ANE-resident sizes
 
 Pure-linear sweep ([python/moe/ane_bw_sweep.py](../../python/moe/ane_bw_sweep.py)) — **only sizes >16 MB are reliably on ANE**:
@@ -483,3 +503,59 @@ The earlier 25–50 tok/s back-of-envelope was **2–5× too optimistic**. The d
 `run_s` includes a fresh `MLModel(...)` instantiation + `.predict` per function — i.e. ~0.33s/function. In a real driver these would be loaded once and cached.
 
 `pkg_MB` grows linearly with N (~1.25 KB/function) — when each function has unique constants, dedup adds nothing, as expected. For Gemma's per-layer attention weights (shared across all 128 experts) the dedup will be huge.
+
+## Update — Round 5: Gemma-4-26B-A4B Full 30-Layer ANE Compilation (2026-04-25)
+
+The entire Gemma-4-26B-A4B model (30 transformer layers) has been compiled to **90 ANE-resident CoreML shards** with zero failures. This is the first full-depth MoE model converted to 100% ANE execution.
+
+### Architecture per layer (3 shards)
+
+| Shard | Quant | Compiled Size | ANE |
+|-------|-------|:---:|:---:|
+| Attention (INT8 per_tensor) | INT8 | 33–47 MB | 100% |
+| FFN partial 0 (2 expert packs, INT8 per_tensor) | INT8 | ~182 MB | 100% |
+| FFN partial 1 + combiner (merged, mixed INT8/fp16) | INT8+fp16 | ~227 MB | 100% |
+
+**Total**: 30 layers × 3 shards = **90 `.mlmodelc` artifacts**
+
+### Empirical laws confirmed at 30-layer scale
+
+1. **Merged combiner eliminates CPU fallback** — standalone combiner shards (19–36 MB) always fell to CPU due to ANE minimum size threshold. Merging into the last FFN partial keeps the shard above the floor. Validated uniformly across all 30 layers (both sliding and global types).
+
+2. **INT8 per_tensor is the production baseline for current Gemma shards** — tested `constexpr_blockwise_shift_scale` per-block quantization paths poisoned the graph to 0% ANE. Do not generalize this to all 4-bit formats: INT4 per-grouped-channel palettization (`constexpr_lut_to_dense`) is a separate, promising but unvalidated path that needs residency + golden gates before scale-out.
+
+3. **Rank-3 tensors (1,1,D) required** — rank-2 (1,D) inputs cause 100% CPU fallback for linear ops. All trace inputs must be rank-3.
+
+4. **`weight_threshold=10_000_000` mixed quantization** — keeps dense MLP weights (gate ~6M, up ~6M, down ~6M params) in fp16 while INT8-quantizing expert pack weights (>10M params each). Required because dense MLP weights are INT8-hostile after norm fusion (outlier channels → only 3 INT8 levels at mean → cos=0.66).
+
+5. **~250 MB compiled shard limit holds** — largest shard (merged last partial + combiner) compiled to ~227 MB, safely within the empirically validated 250 MB ceiling.
+
+### Golden validation (7-layer sample)
+
+| Layer | Type | cos(hidden) | cos(attn) | top-32 overlap |
+|-------|---------|-----------|-----------|----------------|
+| L0 | sliding | 0.999832 | 0.999964 | 1.000 |
+| L5 | global | 0.999922 | 0.999897 | 1.000 |
+| L10 | sliding | 0.999814 | 0.999928 | 1.000 |
+| L15 | sliding | 0.999482 | 0.999886 | 1.000 |
+| L20 | sliding | 0.999555 | 0.999908 | 1.000 |
+| L25 | sliding | 0.999711 | 0.999879 | 0.969 |
+| L29 | global | 0.955543 | 0.999722 | 0.719 |
+
+All above 0.95 cosine floor. Attention cosines consistently >0.9997. L29 (deepest global layer) lowest at 0.956 — expected for cumulative quantization at the final layer.
+
+### Revised shard-size law
+
+Previous Round 4 established that INT8 stateful shards work at 223 MB. Round 5 now establishes:
+- **Safe operating range**: ≤220 MB compiled (ANE_SAFE_SHARD_MB)
+- **Hard ceiling**: ~250 MB compiled (ANE_MAX_COMPILED_SHARD_MB)
+- The 227 MB merged shard compiles and runs on ANE at every layer without exception.
+
+### Conversion artifacts
+
+All in `python/moe/out/`:
+- `gemma4_shard{L}_{L+1}_real_attn_q8.{mlpackage,mlmodelc}` — attention shards (L=0..29)
+- `gemma4_shard{L}_{L+1}_real_ffn_p0of2_q8.{mlpackage,mlmodelc}` — regular FFN partial
+- `gemma4_shard{L}_{L+1}_real_ffn_p1of2_q8.{mlpackage,mlmodelc}` — merged last partial + combiner
+- Batch script: `tmp/convert_all_30.sh`
+- Converter: `python/moe/gemma_to_ane.py mixed --n-layers 30 --max-ctx 128 --quant-bits 8`

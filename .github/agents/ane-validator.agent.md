@@ -1,5 +1,5 @@
 ---
-description: "Use to verify a CoreML op pattern lands on ANE before scaling it to all layers. Runs the smallest representative probe (1 layer, smallest ctx, INT4) and reports per-op compute-unit placement (ANE/GPU/CPU). Triggers: 'check ANE placement', 'residency probe', 'ANE validate', 'will this stay on ANE'."
+description: "Use to verify a CoreML op pattern lands on ANE before scaling it to all layers. Runs the smallest representative probe for the exact compression family under test and reports per-op compute-unit placement (ANE/GPU/CPU). Triggers: 'check ANE placement', 'residency probe', 'ANE validate', 'will this stay on ANE'."
 tools: [read, edit, execute, search]
 user-invocable: false
 ---
@@ -16,7 +16,8 @@ pattern will execute on the Neural Engine, not silently fall back to CPU/GPU.
 ## Approach
 
 1. Identify the op pattern under test from the parent agent's prompt
-   (e.g., "packed GeGLU at G=8, INT4, d_model=2816, ffn=704").
+   (e.g., "packed GeGLU at G=8, INT8 per-tensor" or
+   "LM-head Conv2d, INT4 per-grouped-channel palettization").
 2. Pick the closest existing probe in `python/moe/`:
    - dense linear / quant variants → `gemma_format_sweep.py`
    - packed experts → `gemma_packed_experts.py`
@@ -24,8 +25,9 @@ pattern will execute on the Neural Engine, not silently fall back to CPU/GPU.
    - generic ANE residency → `ane_format_sweep.py`, `ane_device_probe.py`
 3. If an existing probe covers it, run with `/Applications/Xcode.app/Contents/Developer/usr/bin/python3`
    (the only interpreter with coremltools 9). Capture per-op compute-unit table.
-4. If no existing probe covers it, write a minimal new one (≤ 80 lines, INT4 only,
-   one layer, no kv state) — DO NOT extend it to multi-layer.
+4. If no existing probe covers it, write a minimal new one for the exact encoding
+   under test (linear INT4 per-block, INT4 palettization, INT8 per-tensor, W8A8,
+   etc.), one layer or smaller, no kv state — DO NOT extend it to multi-layer.
 5. Apply ANE laws:
    - All ops on ANE → PASS
    - Any op on CPU/GPU → FAIL with the offending op name + weight size
@@ -38,7 +40,7 @@ pattern will execute on the Neural Engine, not silently fall back to CPU/GPU.
 
 Probe: <script>
 Shape: <relevant dims>
-Quant: <INT4|...>
+Quant: <INT8 per_tensor|linear INT4 per_block|INT4 palettized g32|W8A8|...>
 
 | op | weight MB | placement | latency ms |
 |----|-----------|-----------|------------|
