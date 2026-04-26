@@ -26,6 +26,16 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    parse_gib_value,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -38,17 +48,61 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--device", default="cpu")  # CPU is fine; we only need router outputs
     p.add_argument("--dtype", default="bfloat16")
+    p.add_argument("--offload", dest="offload", action="store_true", default=True)
+    p.add_argument("--no-offload", dest="offload", action="store_false")
+    p.add_argument("--offload-folder", type=Path, default=Path(".offload_expert_utilization"))
+    p.add_argument("--max-cpu-mem", default=f"{DEFAULT_MAX_CPU_MEMORY_GIB}GiB")
+    p.add_argument("--max-disk-mem", default=f"{DEFAULT_MAX_DISK_MEMORY_GIB}GiB")
+    p.add_argument("--disk-free-min-gb", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    p.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    p.add_argument("--allow-no-disk-offload", action="store_true")
     args = p.parse_args()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    max_cpu_memory_gib = parse_gib_value(args.max_cpu_mem)
+    max_disk_memory_gib = parse_gib_value(args.max_disk_mem)
+
+    validate_full_model_load_policy(
+        "expert_utilization",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=max_cpu_memory_gib,
+        max_disk_memory_gib=max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
+
+    disk_paths = [Path(args.model), out_path.parent]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gb)
 
     print(f"[load] tokenizer + model from {args.model}")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     dtype = getattr(torch, args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=dtype, device_map=args.device,
-    )
+    print(f"[load] memory policy offload={args.offload} cpu={max_cpu_memory_gib}GiB disk={max_disk_memory_gib}GiB")
+    if args.offload:
+        model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
+            torch_dtype=dtype,
+            offload_enabled=True,
+            offload_folder=args.offload_folder,
+            max_cpu_memory_gib=max_cpu_memory_gib,
+            max_disk_memory_gib=max_disk_memory_gib,
+            local_files_only=False,
+        )
+        print(f"[load] offload folder: {actual_offload_folder}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            trust_remote_code=True,
+            **model_kwargs,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        ).to(torch.device(args.device))
     model.eval()
 
     cfg = model.config
