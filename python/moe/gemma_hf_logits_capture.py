@@ -13,6 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -23,6 +24,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 PROMPT = "The capital of France is"
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_DIR = Path("python/moe/out")
@@ -31,6 +41,27 @@ LATEST_LINK = OUT_DIR / "gemma_hf_golden_logits.npz"
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True)
+    ap.add_argument("--no-offload", dest="offload", action="store_false")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_DIR / ".offload_hf_logits_capture")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
+    args = ap.parse_args()
+
+    validate_full_model_load_policy(
+        "gemma_hf_logits_capture",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
+
     if SENTINEL.exists():
         print(f"sentinel already exists: {SENTINEL}")
         print("Delete it to recapture.")
@@ -45,6 +76,10 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer, __version__ as tfv
     print(f"  transformers={tfv}  torch={torch.__version__}")
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
 
     print("  loading tokenizer...")
     tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
@@ -53,14 +88,23 @@ def main():
     print(f"  tokens ({input_ids.shape[1]}): {input_ids[0].tolist()}")
     print(f"  decoded: {[tok.decode([i]) for i in input_ids[0].tolist()]}")
 
-    print("  loading model fp16 on CPU (this takes a while; 26 GB)...")
+    print("  loading model fp16 with guarded offload policy...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
+    )
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_DIR),
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-    ).eval()
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), **model_kwargs).eval()
     print(f"  load wall: {time.perf_counter()-t0:.1f}s")
 
     print("  forward...")

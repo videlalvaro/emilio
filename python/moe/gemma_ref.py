@@ -12,11 +12,21 @@ Saves to python/moe/out/gemma_golden.npz:
 
 Run:  .venv313/bin/python python/moe/gemma_ref.py
 """
+import argparse
 from pathlib import Path
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
 
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_PATH  = Path("python/moe/out/gemma_golden.npz")
@@ -27,12 +37,48 @@ N_GEN  = 16
 
 
 def main():
-    print("loading tokenizer + model (bf16, CPU)...")
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, dtype=torch.bfloat16, device_map="cpu",
-        low_cpu_mem_usage=True,
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True)
+    ap.add_argument("--no-offload", dest="offload", action="store_false")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_PATH.parent / ".offload_gemma_ref")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
+    args = ap.parse_args()
+
+    validate_full_model_load_policy(
+        "gemma_ref",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
     )
+
+    print("loading tokenizer + model (bf16, guarded offload policy)...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
+    )
+    disk_paths = [MODEL_DIR, OUT_PATH.parent]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
+        torch_dtype=torch.bfloat16,
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, **model_kwargs)
     model.eval()
     print(f"  model class: {type(model).__name__}")
 

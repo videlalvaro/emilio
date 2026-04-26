@@ -17,6 +17,15 @@ from pathlib import Path
 
 import numpy as np
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 OUT_DIR = Path("python/moe/out")
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 REAP_MASK = OUT_DIR / "gemma_reap_mask.npz"
@@ -24,6 +33,7 @@ HEAD_NPZ = OUT_DIR / "gemma_logit_head.npz"
 GOLDEN_NPZ = OUT_DIR / "gemma_golden.npz"
 DEFAULT_PREFIX = Path("/tmp/gemma_swift_t415_decode_full_trace_run2")
 INTERNAL_STAGE_HOOKS = {
+    "attn_delta": "post_attention_layernorm",
     "post_attn": "post_attention_layernorm",
     "ffn_out": "post_feedforward_layernorm",
 }
@@ -169,6 +179,8 @@ def _hf_stage_value(stage_name, position, hidden_states, decoder_layers,
             "ensure hooks were registered before the forward pass")
     hook_tensor = internal_stage_tensors[hook_key]
     hook_value = hook_tensor[0, position].float().cpu().numpy()
+    if suffix == "attn_delta":
+        return hook_value
     if suffix == "post_attn":
         base_hidden = hidden_states[boundary][0, position].float().cpu().numpy()
         return base_hidden + hook_value
@@ -184,12 +196,26 @@ def _apply_reap_mask(decoder_layers, keep_idx, torch):
         mask[torch.from_numpy(keep_idx[layer_index])] = True
         masks.append(mask)
 
+    def live_tensor(module, name, device, dtype=None):
+        value = getattr(module, name)
+        if value.device.type == "meta":
+            hook = getattr(module, "_hf_hook", None)
+            if hook is None or hook.weights_map is None or name not in hook.weights_map:
+                raise RuntimeError(
+                    f"{module.__class__.__name__}.{name} is on meta and no accelerate weights_map entry exists"
+                )
+            value = hook.weights_map[name]
+        if dtype is not None:
+            return value.to(device=device, dtype=dtype)
+        return value.to(device=device)
+
     def make_patched(orig_router, keep_mask):
         not_kept = ~keep_mask
 
         def patched(hidden_states):
             x = orig_router.norm(hidden_states)
-            x = x * orig_router.scale * orig_router.scalar_root_size
+            scale = live_tensor(orig_router, "scale", device=x.device, dtype=x.dtype)
+            x = x * scale * orig_router.scalar_root_size
             scores = orig_router.proj(x)
             min_value = torch.finfo(scores.dtype).min
             scores = scores.masked_fill(not_kept.to(scores.device), min_value)
@@ -200,7 +226,13 @@ def _apply_reap_mask(decoder_layers, keep_idx, torch):
                 dim=-1,
             )
             top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
-            top_weights = top_weights * orig_router.per_expert_scale[top_indices]
+            per_expert_scale = live_tensor(
+                orig_router,
+                "per_expert_scale",
+                device=top_weights.device,
+                dtype=top_weights.dtype,
+            )
+            top_weights = top_weights * per_expert_scale[top_indices]
             return probs, top_weights, top_indices
 
         return patched
@@ -215,7 +247,27 @@ def main() -> int:
                     help="prefix used by --dump-hidden-boundary-prefix")
     ap.add_argument("--golden", default=str(GOLDEN_NPZ),
                     help="golden decode NPZ used only for same-prefix checks")
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True,
+                    help="enable disk offload for the full HF model load (default: on)")
+    ap.add_argument("--no-offload", dest="offload", action="store_false",
+                    help="disable disk offload; requires explicit unsafe override")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_DIR / ".offload_hidden_boundary_compare")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
     args = ap.parse_args()
+
+    validate_full_model_load_policy(
+        "gemma_hf_hidden_boundary_compare",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
 
     if "venv313" not in sys.executable:
         raise SystemExit(
@@ -230,6 +282,10 @@ def main() -> int:
     meta_path = Path(str(prefix) + "_hidden_boundaries_meta.json")
     bin_path = Path(str(prefix) + "_hidden_boundaries_f32.bin")
     golden_path = Path(args.golden)
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
     for path in [meta_path, bin_path, REAP_MASK, HEAD_NPZ, MODEL_DIR, golden_path]:
         if not path.exists():
             raise SystemExit(f"FATAL missing artifact: {path}")
@@ -268,13 +324,22 @@ def main() -> int:
     print(f"  stage names: {stage_names}")
 
     print("  loading model...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
+    )
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_DIR),
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-    ).eval()
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), **model_kwargs).eval()
     print(f"  load wall: {time.perf_counter() - t0:.1f}s")
 
     decoder_layers = _resolve_decoder_layers(model)

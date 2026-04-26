@@ -20,6 +20,7 @@ Usage (must be .venv313):
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import sys
@@ -35,16 +36,35 @@ import numpy as np
 import torch
 import transformers
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 assert transformers.__version__.split(".")[0] in ("4", "5"), \
     f"Unexpected transformers major: {transformers.__version__}"
 
-PROMPT = "The capital of France is"
+DEFAULT_PROMPT = "The capital of France is"
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_DIR = Path("python/moe/out")
-SENTINEL = OUT_DIR / ".gemma_hf_golden_reap_PASS"
-LATEST_LINK = OUT_DIR / "gemma_hf_golden_logits_reap.npz"
 REAP_MASK = OUT_DIR / "gemma_reap_mask.npz"
 SIDE_JSON_SUFFIX = "_router_audit.json"
+
+
+def _prompt_sha8(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode()).hexdigest()[:8]
+
+
+def _sentinel_path(prompt: str) -> Path:
+    return OUT_DIR / f".gemma_hf_golden_reap_PASS_{_prompt_sha8(prompt)}"
+
+
+def _latest_link_path(prompt: str) -> Path:
+    return OUT_DIR / f"gemma_hf_golden_logits_reap__{_prompt_sha8(prompt)}.npz"
 
 
 def _atomic_write_npz(target: Path, **arrays):
@@ -70,6 +90,35 @@ def _atomic_symlink(link: Path, target_name: str):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True,
+                    help="enable disk offload for the full HF model load (default: on)")
+    ap.add_argument("--no-offload", dest="offload", action="store_false",
+                    help="disable disk offload; requires explicit unsafe override")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_DIR / ".offload_hf_golden_reap")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
+    ap.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
+                    help=f"prompt text (default: {DEFAULT_PROMPT!r})")
+    args = ap.parse_args()
+
+    PROMPT = args.prompt
+    SENTINEL = _sentinel_path(PROMPT)
+    LATEST_LINK = _latest_link_path(PROMPT)
+
+    validate_full_model_load_policy(
+        "gemma_hf_logits_capture_reap",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
+
     if SENTINEL.exists():
         print(f"sentinel already exists: {SENTINEL}")
         print("Delete it to recapture.")
@@ -94,6 +143,10 @@ def main():
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     print(f"  torch threads = {nth}")
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
 
     # --- recommended #6: free-RAM gate ---------------------------------
     try:
@@ -122,14 +175,23 @@ def main():
     print(f"  tokens ({input_ids.shape[1]}): {input_ids[0].tolist()}")
     print(f"  decoded: {[tok.decode([i]) for i in input_ids[0].tolist()]}")
 
-    print("  loading model fp16 on CPU (this takes a while; 26 GB)...")
+    print("  loading model fp16 with guarded offload policy...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
+    )
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_DIR),
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-    ).eval()
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), **model_kwargs).eval()
     print(f"  load wall: {time.perf_counter()-t0:.1f}s")
 
     # --- monkey-patch routers per layer --------------------------------
@@ -163,76 +225,69 @@ def main():
         layer_keep_masks.append(m)
 
     # --- REQUIRED #3: patch + assert effectiveness ---------------------
+    # Use register_forward_hook on router.proj to inject -inf mask BETWEEN
+    # proj output and softmax. This cooperates with accelerate disk-offload
+    # hooks (which materialize meta-device parameters during __call__).
+    # We never access raw parameters, avoiding the meta-tensor trap.
     audit_log = {"per_layer": [], "model_sha8": "", "prompt_sha8": ""}
     patch_count = 0
 
-    def make_patched_forward(orig_router: Gemma4TextRouter, keep_mask: torch.Tensor,
-                             layer_idx: int, audit_target: list):
-        # Bind: router, mask, layer_idx, audit_target.
-        # Replicates HF's Gemma4TextRouter.forward but with -inf masking
-        # before softmax. See modeling_gemma4.py Gemma4TextRouter.forward.
-        not_kept = ~keep_mask  # (128,)
+    def make_proj_hook(keep_mask: torch.Tensor, layer_idx: int):
+        """Forward hook on router.proj: mask non-kept expert scores to -inf."""
+        not_kept = ~keep_mask
         first_call_done = {"flag": False}
 
-        def patched(hidden_states: torch.Tensor):
-            x = orig_router.norm(hidden_states)
-            x = x * orig_router.scale * orig_router.scalar_root_size
-            expert_scores = orig_router.proj(x)        # [B*S, 128]
-
-            # Mask non-kept to -inf BEFORE softmax (log-sum-exp safe).
-            ns = expert_scores.dtype
-            mask_value = torch.finfo(ns).min
-            expert_scores = expert_scores.masked_fill(not_kept.to(expert_scores.device),
-                                                       mask_value)
-
+        def hook(_module, _input, output):
+            mask_value = torch.finfo(output.dtype).min
+            masked = output.masked_fill(not_kept.to(output.device), mask_value)
             # First-call assertions (REQUIRED #3).
             if not first_call_done["flag"]:
-                assert (expert_scores[..., not_kept] <= mask_value + 1).all(), \
+                assert (masked[..., not_kept] <= mask_value + 1).all(), \
                     f"L{layer_idx}: mask not applied (non-kept not min-valued)"
-                assert torch.isfinite(expert_scores[..., keep_mask]).all(), \
+                assert torch.isfinite(masked[..., keep_mask]).all(), \
                     f"L{layer_idx}: kept-expert scores not finite"
                 first_call_done["flag"] = True
+            return masked
 
-            router_probabilities = torch.nn.functional.softmax(
-                expert_scores, dim=-1)
+        return hook
 
+    def make_router_hook(keep_mask: torch.Tensor, layer_idx: int,
+                         audit_target: list):
+        """Forward hook on router: audit + verify mask effectiveness."""
+        def hook(_module, _input, output):
+            router_probs, top_k_weights, top_k_index = output
             # Verify mask actually zeroed non-kept probabilities.
-            if len(audit_target) == 0:  # only first layer to keep cheap
-                kept_prob_sum = float(router_probabilities[..., keep_mask].sum(-1).mean())
+            if len(audit_target) == 0:
+                kept_prob_sum = float(
+                    router_probs[..., keep_mask].sum(-1).mean())
                 assert kept_prob_sum > 0.999, \
                     f"L{layer_idx}: kept prob sum {kept_prob_sum:.6f} < 0.999"
-
-            top_k_weights, top_k_index = torch.topk(
-                router_probabilities,
-                k=orig_router.config.top_k_experts,
-                dim=-1,
-            )
-            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-            top_k_weights = top_k_weights * orig_router.per_expert_scale[top_k_index]
-
-            # Audit: log first-token, last-position routing.
             audit_target.append({
                 "layer": layer_idx,
                 "kept_prob_sum_first_pos": float(
-                    router_probabilities[0, keep_mask].sum().item()
-                    if router_probabilities.dim() == 2
-                    else router_probabilities.flatten()[keep_mask].sum().item()
+                    router_probs[0, keep_mask].sum().item()
+                    if router_probs.dim() == 2
+                    else router_probs.flatten()[keep_mask].sum().item()
                 ),
                 "top1_expert_first_pos": int(top_k_index.flatten()[0].item()),
-                "top1_in_keep": bool(keep_mask[int(top_k_index.flatten()[0].item())].item()),
+                "top1_in_keep": bool(
+                    keep_mask[int(top_k_index.flatten()[0].item())].item()),
             })
+            return output
 
-            return router_probabilities, top_k_weights, top_k_index
-
-        return patched
+        return hook
 
     for li, dec in enumerate(decoder_layers):
         if not hasattr(dec, "router"):
             print(f"FATAL: L{li} has no .router attr (enable_moe_block=False?)",
                   file=sys.stderr); sys.exit(2)
         per_layer_audit: list = []
-        dec.router.forward = make_patched_forward(
-            dec.router, layer_keep_masks[li], li, per_layer_audit)
+        # Hook on proj: inject -inf mask before softmax.
+        dec.router.proj.register_forward_hook(
+            make_proj_hook(layer_keep_masks[li], li))
+        # Hook on router: audit routing after softmax + topk.
+        dec.router.register_forward_hook(
+            make_router_hook(layer_keep_masks[li], li, per_layer_audit))
         audit_log["per_layer"].append(per_layer_audit)
         patch_count += 1
     assert patch_count == 30, f"patched only {patch_count}/30 routers"
@@ -261,7 +316,7 @@ def main():
           f"all top-1 experts inside keep_idx")
 
     # --- save (atomic) -------------------------------------------------
-    prompt_hash = hashlib.sha256(PROMPT.encode()).hexdigest()[:8]
+    prompt_hash = _prompt_sha8(PROMPT)
     idx_text = (MODEL_DIR / "model.safetensors.index.json").read_bytes()
     model_sha8 = hashlib.sha256(idx_text).hexdigest()[:8]
     audit_log["prompt_sha8"] = prompt_hash

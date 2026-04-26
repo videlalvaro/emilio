@@ -35,6 +35,15 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 MODEL_DIR  = Path("models/gemma-4-26b-a4b")
 OUT_DIR    = Path("python/moe/out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 SCORES_NPZ = OUT_DIR / "gemma_reap_scores.npz"
@@ -61,13 +70,28 @@ TOPK_MATCH_THRESHOLD = 14  # out of 16
 
 # ----------------------------- helpers --------------------------------------
 
-def load_model():
-    print("loading tokenizer + model (bf16, CPU)...")
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, dtype=torch.bfloat16, device_map="cpu",
-        low_cpu_mem_usage=True,
+def load_model(args):
+    print("loading tokenizer + model (bf16, guarded offload policy)...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
     )
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
+        torch_dtype=torch.bfloat16,
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, **model_kwargs)
     model.eval()
     cfg = model.config.text_config
     return tok, model, cfg
@@ -108,7 +132,7 @@ def _load_calib_ids(tok, args):
 
 
 def cmd_calibrate(args):
-    tok, model, cfg = load_model()
+    tok, model, cfg = load_model(args)
     n_experts = cfg.num_experts
     top_k = cfg.top_k_experts
     n_layers = cfg.num_hidden_layers
@@ -224,7 +248,7 @@ def cmd_validate(args):
     golden_next_ids = gd["next_token_ids"]
     n_gen = len(golden_next_ids)
 
-    tok, model, cfg = load_model()
+    tok, model, cfg = load_model(args)
     routers = find_router_modules(model, cfg.num_experts)
 
     # Hook each router output and add -inf to dropped expert positions
@@ -369,7 +393,7 @@ def cmd_pack_locality(args):
         for compact, orig in enumerate(keep_idx[li]):
             remap[li, orig] = compact
 
-    tok, model, cfg = load_model()
+    tok, model, cfg = load_model(args)
     n_experts = cfg.num_experts
     top_k     = cfg.top_k_experts
     assert n_experts == E and cfg.num_hidden_layers == L
@@ -466,6 +490,17 @@ def cmd_pack_locality(args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True,
+                    help="enable disk offload for the full HF model load (default: on)")
+    ap.add_argument("--no-offload", dest="offload", action="store_false",
+                    help="disable disk offload; requires explicit unsafe override")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_DIR / ".offload_gemma_reap")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
     sub = ap.add_subparsers(dest="mode", required=True)
 
     a = sub.add_parser("calibrate", help="capture router-gate scores")
@@ -494,6 +529,15 @@ def main():
     d.set_defaults(func=cmd_pack_locality)
 
     args = ap.parse_args()
+    if args.mode in {"calibrate", "validate", "pack_locality"}:
+        validate_full_model_load_policy(
+            "gemma_reap",
+            offload_enabled=args.offload,
+            max_cpu_memory_gib=args.max_cpu_memory_gib,
+            max_disk_memory_gib=args.max_disk_memory_gib,
+            allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+            allow_no_disk_offload=args.allow_no_disk_offload,
+        )
     args.func(args)
 
 

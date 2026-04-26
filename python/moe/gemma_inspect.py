@@ -9,6 +9,7 @@ conversion strategy:
 
 Run with:  .venv313/bin/python python/moe/gemma_inspect.py
 """
+import argparse
 import json
 from collections import Counter
 from pathlib import Path
@@ -17,6 +18,15 @@ import numpy as np
 import torch
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
 
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_DIR   = Path("python/moe/out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,7 +71,7 @@ def dump_tensor_shapes():
             print(f"    {k:80s}  {tuple(t.get_shape())}  {t.get_dtype()}")
 
 
-def routing_entropy(n_calib_tokens: int = 512):
+def routing_entropy(args, n_calib_tokens: int = 512):
     """Run a tiny forward pass and capture router decisions per MoE layer.
 
     For pack size G ∈ {4, 8, 16, 32}, count distinct packs spanned by the
@@ -69,12 +79,27 @@ def routing_entropy(n_calib_tokens: int = 512):
     fewer ANE calls per layer.
     """
     section(f"ROUTING — {n_calib_tokens} calibration tokens")
-    print("  loading model in bf16 on CPU (this may take a couple of minutes)...")
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, dtype=torch.bfloat16, device_map="cpu",
-        low_cpu_mem_usage=True,
+    print("  loading model in bf16 with guarded offload policy...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
     )
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
+        torch_dtype=torch.bfloat16,
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, **model_kwargs)
     model.eval()
 
     # Hook every MoE router. The Gemma4 MoE block routes via a Linear layer;
@@ -160,8 +185,33 @@ def routing_entropy(n_calib_tokens: int = 512):
              pack_sizes=np.array([4, 8, 16, 32]))
     print(f"\n  saved → {OUT_DIR/'gemma_routing.npz'}")
 
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--calib-tokens", type=int, default=512)
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True)
+    ap.add_argument("--no-offload", dest="offload", action="store_false")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=OUT_DIR / ".offload_gemma_inspect")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
+    args = ap.parse_args()
 
-if __name__ == "__main__":
+    validate_full_model_load_policy(
+        "gemma_inspect",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
+
     dump_arch()
     dump_tensor_shapes()
-    routing_entropy(n_calib_tokens=512)
+    routing_entropy(args, n_calib_tokens=args.calib_tokens)
+
+
+if __name__ == "__main__":
+    main()

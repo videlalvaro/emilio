@@ -26,6 +26,15 @@ import numpy as np
 import torch
 import transformers
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 from gemma_closedform_battery_spec import (
     BATTERY,
     HF_OUT_NPZ,
@@ -110,7 +119,27 @@ def main():
                     help="process only the prompt with this stable key")
     ap.add_argument("--force", action="store_true",
                     help="recompute selected prompts even if partial results exist")
+    ap.add_argument("--offload", dest="offload", action="store_true", default=True,
+                    help="enable disk offload for the full HF model load (default: on)")
+    ap.add_argument("--no-offload", dest="offload", action="store_false",
+                    help="disable disk offload; requires explicit unsafe override")
+    ap.add_argument("--offload-folder", type=Path,
+                    default=HF_OUT_NPZ.parent / ".offload_closedform_battery")
+    ap.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    ap.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    ap.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    ap.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    ap.add_argument("--allow-no-disk-offload", action="store_true")
     args = ap.parse_args()
+
+    validate_full_model_load_policy(
+        "gemma_hf_closedform_battery",
+        offload_enabled=args.offload,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+        allow_no_disk_offload=args.allow_no_disk_offload,
+    )
 
     if HF_SENTINEL.exists() and not args.force:
         print(f"sentinel exists: {HF_SENTINEL} (delete to recapture)")
@@ -142,6 +171,10 @@ def main():
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     print(f"  torch threads = {nth}  transformers={transformers.__version__}")
+    disk_paths = [MODEL_DIR, HF_OUT_NPZ.parent]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
@@ -161,14 +194,23 @@ def main():
 
     results = {} if args.force else _load_partial_results()
 
-    print("  loading model fp16 CPU (26 GB)...")
+    print("  loading model fp16 with guarded offload policy...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
+    )
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_DIR),
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-    ).eval()
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), **model_kwargs).eval()
     print(f"  load wall: {time.perf_counter()-t0:.1f}s")
 
     text_model = getattr(model, "model", None) or model

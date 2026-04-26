@@ -46,6 +46,15 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from hf_full_model_safety import (
+    DEFAULT_DISK_FREE_MIN_GIB,
+    DEFAULT_MAX_CPU_MEMORY_GIB,
+    DEFAULT_MAX_DISK_MEMORY_GIB,
+    prepare_model_load_kwargs,
+    require_disk_free,
+    validate_full_model_load_policy,
+)
+
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_DIR   = Path("python/moe/out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -61,14 +70,29 @@ def golden_path(ctx: int) -> Path:
 
 # ----------------------------- model load ----------------------------------
 
-def load_model():
-    print("loading tokenizer + model (bf16, CPU)...")
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, dtype=torch.bfloat16, device_map="cpu",
-        low_cpu_mem_usage=True,
-        attn_implementation="eager",
+def load_model(args):
+    print("loading tokenizer + model (bf16, guarded offload policy)...")
+    print(
+        f"  memory policy: offload={args.offload} cpu={args.max_cpu_memory_gib}GiB "
+        f"disk={args.max_disk_memory_gib}GiB"
     )
+    disk_paths = [MODEL_DIR, OUT_DIR]
+    if args.offload:
+        disk_paths.append(args.offload_folder)
+    require_disk_free(disk_paths, args.disk_free_min_gib)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model_kwargs, actual_offload_folder = prepare_model_load_kwargs(
+        torch_dtype=torch.bfloat16,
+        offload_enabled=args.offload,
+        offload_folder=args.offload_folder,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        max_disk_memory_gib=args.max_disk_memory_gib,
+        local_files_only=True,
+    )
+    model_kwargs["attn_implementation"] = "eager"
+    if actual_offload_folder is not None:
+        print(f"  offload folder: {actual_offload_folder}")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, **model_kwargs)
     model.eval()
     cfg = model.config.text_config
     return tok, model, cfg
@@ -101,7 +125,7 @@ def cmd_golden_long(args):
     if out_path.exists() and not args.force:
         raise SystemExit(f"{out_path} already exists; pass --force to overwrite")
 
-    tok, model, cfg = load_model()
+    tok, model, cfg = load_model(args)
     prompt_ids = build_long_prompt(tok, args.ctx)
     print(f"prompt: {prompt_ids.shape[1]} tokens (wikitext-2 train slice)")
 
@@ -273,7 +297,7 @@ def cmd_validate(args):
     golden_step_logits = gd["next_token_logits"]
     n_gen = len(golden_next_ids)
 
-    tok, model, cfg = load_model()
+    tok, model, cfg = load_model(args)
     prev_impl = install_moba(model, cfg,
                              block_size=args.block_size,
                              top_k=args.top_k,
@@ -377,6 +401,15 @@ def cmd_latency_proj(args):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--offload", dest="offload", action="store_true", default=True)
+    p.add_argument("--no-offload", dest="offload", action="store_false")
+    p.add_argument("--offload-folder", type=Path,
+                   default=OUT_DIR / ".offload_gemma_moba")
+    p.add_argument("--max-cpu-memory-gib", type=int, default=DEFAULT_MAX_CPU_MEMORY_GIB)
+    p.add_argument("--max-disk-memory-gib", type=int, default=DEFAULT_MAX_DISK_MEMORY_GIB)
+    p.add_argument("--disk-free-min-gib", type=int, default=DEFAULT_DISK_FREE_MIN_GIB)
+    p.add_argument("--allow-unsafe-cpu-memory", action="store_true")
+    p.add_argument("--allow-no-disk-offload", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pg = sub.add_parser("golden_long")
@@ -398,6 +431,15 @@ def main():
     pl.set_defaults(func=cmd_latency_proj)
 
     args = p.parse_args()
+    if args.cmd in {"golden_long", "validate"}:
+        validate_full_model_load_policy(
+            "gemma_moba_probe",
+            offload_enabled=args.offload,
+            max_cpu_memory_gib=args.max_cpu_memory_gib,
+            max_disk_memory_gib=args.max_disk_memory_gib,
+            allow_unsafe_cpu_memory=args.allow_unsafe_cpu_memory,
+            allow_no_disk_offload=args.allow_no_disk_offload,
+        )
     args.func(args)
 
 
