@@ -1,5 +1,5 @@
-"""pack_gemma_layer.py — extract one Gemma-4 layer, REAP-prune to keep=64,
-pack into 4 groups of 16 contiguous experts, save as a single fp16 .npz
+"""pack_gemma_layer.py — extract one Gemma-4 layer, pack all 128 experts
+into 8 groups of 16 contiguous experts, save as a single fp16 .npz
 that gemma_to_ane.py consumes.
 
 Run with the Xcode python (has safetensors + numpy):
@@ -18,7 +18,6 @@ from safetensors import safe_open
 
 MODEL_DIR = Path("models/gemma-4-26b-a4b")
 OUT_DIR   = Path("python/moe/out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
-MASK_PATH = OUT_DIR / "gemma_reap_mask.npz"
 
 D_MODEL  = 2816
 D_FFN    = 704     # moe_intermediate
@@ -30,8 +29,8 @@ GLB_NHEADS = 16
 GLB_NKV  = 2
 GLB_DH   = 512
 PACK_G   = 16
-N_PACKS  = 4
-N_KEEP   = 64
+N_PACKS  = 8
+N_EXPERTS = 128
 
 
 def _layer_types() -> list[str]:
@@ -62,10 +61,6 @@ def main():
     layer_types = _layer_types()
     is_global = layer_types[L] == "full_attention"
     print(f"=== pack_gemma_layer L={L}  type={layer_types[L]}  is_global={is_global} ===")
-    mask = np.load(MASK_PATH)
-    keep = mask["keep_idx"][L].astype(np.int64)
-    print(f"  REAP keep_idx (first 8): {keep[:8]} … (total {len(keep)})")
-    assert keep.shape == (N_KEEP,)
 
     idx = _load_index()
     base = f"model.language_model.layers.{L}"
@@ -110,30 +105,21 @@ def main():
     print(f"  shapes: q={q.shape} kv={k.shape} o={o.shape} mlp_g={mlp_g.shape}"
           f" gate_up={gate_up.shape} down={down.shape} rprj={rprj.shape}")
 
-    # ── REAP slice (keep=64 in keep_idx order) ───────────────────────────
-    gate_up_k = gate_up[keep]                  # (64, 1408, 2816)
-    down_k    = down[keep]                     # (64, 2816, 704)
-    rprj_k    = rprj[keep]                     # (64, 2816)
-    rperexp_k = rperexp[keep]                  # (64,)
+    # ── Pack all 128 experts into 8 × 16 ────────────────────────────────
+    assert gate_up.shape[0] == N_EXPERTS
+    gate_e = gate_up[:, :D_FFN, :]              # (128, 704, 2816)
+    up_e   = gate_up[:, D_FFN:, :]              # (128, 704, 2816)
+    down_e = down                                # (128, 2816, 704)
 
-    # ── Pack into 4 × 16 ────────────────────────────────────────────────
-    # gate per expert e: gate_up[e, :D_FFN, :]   → (D_FFN, D_MODEL)
-    # up   per expert e: gate_up[e, D_FFN:, :]   → (D_FFN, D_MODEL)
-    # down per expert e: down[e, :, :]           → (D_MODEL, D_FFN)
-    gate_e = gate_up_k[:, :D_FFN, :]            # (64, 704, 2816)
-    up_e   = gate_up_k[:, D_FFN:, :]            # (64, 704, 2816)
-    down_e = down_k                              # (64, 2816, 704)
-
-    gate_packs = gate_e.reshape(N_PACKS, PACK_G * D_FFN,   D_MODEL)  # (4, 11264, 2816)
-    up_packs   = up_e.reshape(  N_PACKS, PACK_G * D_FFN,   D_MODEL)  # (4, 11264, 2816)
-    down_packs = down_e.reshape(N_PACKS, PACK_G * D_MODEL, D_FFN)    # (4, 45056, 704)
+    gate_packs = gate_e.reshape(N_PACKS, PACK_G * D_FFN,   D_MODEL)  # (8, 11264, 2816)
+    up_packs   = up_e.reshape(  N_PACKS, PACK_G * D_FFN,   D_MODEL)  # (8, 11264, 2816)
+    down_packs = down_e.reshape(N_PACKS, PACK_G * D_MODEL, D_FFN)    # (8, 45056, 704)
 
     # ── To fp16 ──────────────────────────────────────────────────────────
     def to_fp16(x): return x.astype(np.float16)
 
     out_path = OUT_DIR / f"gemma_layer{L}_packed.npz"
     save_kwargs = dict(
-        keep_idx=keep,
         is_global=np.array(is_global),
         # attention
         q_proj=to_fp16(q), k_proj=to_fp16(k), o_proj=to_fp16(o),
@@ -159,10 +145,10 @@ def main():
         gate_packs=to_fp16(gate_packs),
         up_packs=to_fp16(up_packs),
         down_packs=to_fp16(down_packs),
-        # router
-        router_proj=to_fp16(rprj_k),
+        # router (all 128 experts)
+        router_proj=to_fp16(rprj),
         router_scale=to_fp16(rscale),
-        router_per_expert_scale=to_fp16(rperexp_k),
+        router_per_expert_scale=to_fp16(rperexp),
     )
     sz = out_path.stat().st_size / 1e6
     print(f"  → {out_path}  ({sz:.1f} MB)")

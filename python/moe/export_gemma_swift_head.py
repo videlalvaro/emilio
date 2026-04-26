@@ -30,12 +30,75 @@ GAMMA_BIN = "gemma_final_norm_gamma_fp16.bin"
 META_JSON = "gemma_swift_head_meta.json"
 
 TOKENIZER_JSON = "models/gemma-4-26b-a4b/tokenizer.json"
-SHARDS = [
-    {"start": 0, "end": 8, "path": "python/moe/out/gemma4_shard0_8_real.mlmodelc"},
-    {"start": 8, "end": 15, "path": "python/moe/out/gemma4_shard8_15_real.mlmodelc"},
-    {"start": 15, "end": 22, "path": "python/moe/out/gemma4_shard15_22_real.mlmodelc"},
-    {"start": 22, "end": 30, "path": "python/moe/out/gemma4_shard22_30_real.mlmodelc"},
-]
+LM_HEAD_MANIFEST = Path("python/moe/out/lm_head_shards/lm_head_manifest.json")
+LM_HEAD_SHARD_DIR = "python/moe/out/lm_head_shards"
+PER_EXPERT_DIR = Path("python/moe/out/per_expert")
+N_LAYERS = 30
+OUT_SHARD_DIR = "python/moe/out"
+
+
+def _build_lm_head_shards(manifest_path: Path, shard_dir: str) -> list[dict]:
+    manifest = json.loads(manifest_path.read_text())
+    return [
+        {
+            "shard_idx": s["shard_idx"],
+            "vocab_start": s["vocab_start"],
+            "vocab_end": s["vocab_end"],
+            "mlmodelc": f"{shard_dir}/{s['mlmodelc']}",
+        }
+        for s in manifest["shards"]
+    ]
+
+
+def _build_layers(n_layers: int, shard_dir: str, n_ffn_shards: int = 8, quant_suffix: str = "fp16") -> list[dict]:
+    layers = []
+    for i in range(n_layers):
+        layers.append({
+            "layer": i,
+            "attn": f"{shard_dir}/gemma4_shard{i}_{i+1}_real_attn_{quant_suffix}.mlmodelc",
+            "ffn_partials": [
+                f"{shard_dir}/gemma4_shard{i}_{i+1}_real_ffn_p{p}of{n_ffn_shards}_{quant_suffix}.mlmodelc"
+                for p in range(n_ffn_shards - 1)
+            ],
+            "ffn_last": f"{shard_dir}/gemma4_shard{i}_{i+1}_real_ffn_p{n_ffn_shards - 1}of{n_ffn_shards}_{quant_suffix}.mlmodelc",
+        })
+    return layers
+
+
+def _build_per_expert_layers(per_expert_dir: Path, shard_dir: str, quant_suffix: str = "fp16") -> list[dict]:
+    """Build per_expert_layers from per-expert manifest files."""
+    layers = []
+    for layer_dir in sorted(per_expert_dir.iterdir()):
+        manifest_path = layer_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        manifest = json.loads(manifest_path.read_text())
+        layer_idx = manifest["layer"]
+        n_experts = manifest["n_experts"]
+        q_tag = quant_suffix
+
+        # Attn shard comes from the packed shard dir (same as packed path)
+        attn_path = f"{shard_dir}/gemma4_shard{layer_idx}_{layer_idx+1}_real_attn_{q_tag}.mlmodelc"
+
+        expert_paths = []
+        for e in manifest["experts"]:
+            expert_paths.append(e["mlmodelc"])
+
+        combine_path = manifest["combine"]["mlmodelc"]
+        router_proj = str(layer_dir / "router" / "proj_fp16.bin")
+        router_scale = str(layer_dir / "router" / "per_expert_scale_fp16.bin")
+
+        layers.append({
+            "layer": layer_idx,
+            "attn": attn_path,
+            "n_experts": n_experts,
+            "top_k": manifest["top_k"],
+            "experts": expert_paths,
+            "combine": combine_path,
+            "router_proj_bin": router_proj,
+            "router_per_expert_scale_bin": router_scale,
+        })
+    return layers
 
 
 def _atomic_write_bytes(path: Path, blob: bytes):
@@ -60,6 +123,8 @@ def main():
                     help="input NPZ from build_logit_head.py")
     ap.add_argument("--out-dir", type=Path, default=OUT_DIR,
                     help="output directory for Swift runtime artifacts")
+    ap.add_argument("--per-expert-dir", type=Path, default=None,
+                    help="directory with per-expert manifests (adds per_expert_layers)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing outputs")
     args = ap.parse_args()
@@ -101,7 +166,7 @@ def main():
     _atomic_write_bytes(gamma_path, gamma.tobytes(order="C"))
 
     meta = {
-        "artifacts_version": 1,
+        "artifacts_version": 2,
         "embed_bin": embed_path.name,
         "final_norm_gamma_bin": gamma_path.name,
         "vocab_size": vocab_size,
@@ -115,10 +180,20 @@ def main():
         "sliding_rope_theta": 10000.0,
         "global_rope_theta": 1000000.0,
         "sliding_d_head": 256,
-        "global_rot_dim": 512,
+        "global_rot_dim": 128,
         "tokenizer_json": TOKENIZER_JSON,
-        "shards": SHARDS,
+        "layers": _build_layers(N_LAYERS, OUT_SHARD_DIR),
+        "lm_head_shards": _build_lm_head_shards(LM_HEAD_MANIFEST, LM_HEAD_SHARD_DIR),
     }
+
+    # Add per-expert layers if directory provided and has manifests
+    pe_dir = args.per_expert_dir or PER_EXPERT_DIR
+    if pe_dir.exists():
+        pe_layers = _build_per_expert_layers(pe_dir, OUT_SHARD_DIR)
+        if pe_layers:
+            meta["per_expert_layers"] = pe_layers
+            print(f"  per_expert_layers: {len(pe_layers)} layers")
+
     _atomic_write_json(meta_path, meta)
 
     print(f"wrote {embed_path}  ({embed_path.stat().st_size / 1e6:.1f} MB)")
