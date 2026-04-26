@@ -111,6 +111,7 @@ emilio/conv-ane/pf_e2e
 
 # Gemma ANE: compiled Swift binaries (rebuild via swiftc)
 emilio/conv-ane/gemma_ane
+emilio/conv-ane/gemma_ane_pe
 !emilio/conv-ane/gemma_ane.swift
 # Gemma ANE: Obj-C probe binaries (rebuild via clang)
 emilio/conv-ane/ane_chain_probe
