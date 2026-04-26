@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""GGUF → ANE-native CoreML converter for the Qwen2.5 family (0.5B / 1.5B / …).
+"""GGUF → ANE-native CoreML converter for Qwen2.5 and Phi-3/4 families.
 
 All architecture-dependent sizes (d_model, n_heads, n_kv_heads, d_head, d_ff, …)
 are read from the GGUF metadata at runtime — nothing is hardcoded to 0.5B.
+Supports both split (Qwen: attn_q/k/v, ffn_gate+ffn_up) and fused
+(Phi: attn_qkv, fused gate+up in ffn_up) tensor layouts automatically.
 
 Design targeting Apple Neural Engine directly:
   - Float16 throughout (ANE native dtype)
@@ -158,10 +160,23 @@ class GGUFModel:
         arch = self.meta("general.architecture", "qwen2")
         d_model = self.meta(f"{arch}.embedding_length", 896)
         n_heads = self.meta(f"{arch}.attention.head_count", 14)
+        # Derive vocab_size from actual tensor shape — metadata can be wrong
+        # (e.g. Qwen 7B: metadata says 151936, tensor is 152064)
+        meta_vocab = self.meta(f"{arch}.vocab_size",
+                     self.meta("tokenizer.ggml.vocab_size", 151936))
+        if "token_embd.weight" in self.tensors:
+            # GGUF shape is [d_model, vocab] — vocab is the last dim
+            embd_shape = self.tensors["token_embd.weight"]["shape"]
+            tensor_vocab = embd_shape[-1]
+            if tensor_vocab != meta_vocab:
+                print(f"  WARNING: vocab_size mismatch: metadata={meta_vocab}, "
+                      f"tensor={tensor_vocab}. Using tensor shape.")
+            vocab_size = tensor_vocab
+        else:
+            vocab_size = meta_vocab
         return {
             "arch": arch,
-            "vocab_size": self.meta(f"{arch}.vocab_size",
-                          self.meta("tokenizer.ggml.vocab_size", 151936)),
+            "vocab_size": vocab_size,
             "n_layers": self.meta(f"{arch}.block_count", 24),
             "n_heads": n_heads,
             "n_kv_heads": self.meta(f"{arch}.attention.head_count_kv", 2),
@@ -173,6 +188,50 @@ class GGUFModel:
             "eos_token_id": self.meta("tokenizer.ggml.eos_token_id", 151645),
             "bos_token_id": self.meta("tokenizer.ggml.bos_token_id", 151643),
         }
+
+    # ── Architecture-agnostic tensor helpers ────────────────────────────
+
+    def get_qkv_weights(self, prefix, cfg):
+        """Return (q_w, k_w, v_w) as separate numpy arrays.
+        Handles both split (Qwen: attn_q/attn_k/attn_v) and fused (Phi: attn_qkv) layouts."""
+        if f"{prefix}.attn_q.weight" in self.tensors:
+            return (self.get_tensor(f"{prefix}.attn_q.weight"),
+                    self.get_tensor(f"{prefix}.attn_k.weight"),
+                    self.get_tensor(f"{prefix}.attn_v.weight"))
+        # Fused QKV (Phi-3/4): shape (d + 2*kv_dim, d_model)
+        qkv = self.get_tensor(f"{prefix}.attn_qkv.weight")
+        d = cfg["d_model"]
+        kv_dim = cfg["n_kv_heads"] * cfg["d_head"]
+        return qkv[:d], qkv[d:d + kv_dim], qkv[d + kv_dim:]
+
+    def get_qkv_biases(self, prefix, cfg):
+        """Return (q_b, k_b, v_b) or None if no biases exist."""
+        if f"{prefix}.attn_q.bias" in self.tensors:
+            return (self.get_tensor(f"{prefix}.attn_q.bias"),
+                    self.get_tensor(f"{prefix}.attn_k.bias"),
+                    self.get_tensor(f"{prefix}.attn_v.bias"))
+        if f"{prefix}.attn_qkv.bias" in self.tensors:
+            qkv_b = self.get_tensor(f"{prefix}.attn_qkv.bias")
+            d = cfg["d_model"]
+            kv_dim = cfg["n_kv_heads"] * cfg["d_head"]
+            return qkv_b[:d], qkv_b[d:d + kv_dim], qkv_b[d + kv_dim:]
+        return None
+
+    def get_gate_up_weights(self, prefix, cfg):
+        """Return (gate_w, up_w) as separate numpy arrays.
+        Handles both split (Qwen: ffn_gate + ffn_up) and fused (Phi: ffn_up=gate+up) layouts."""
+        if f"{prefix}.ffn_gate.weight" in self.tensors:
+            return (self.get_tensor(f"{prefix}.ffn_gate.weight"),
+                    self.get_tensor(f"{prefix}.ffn_up.weight"))
+        # Fused gate+up (Phi-3/4): ffn_up has shape (2*d_ff, d_model)
+        fused = self.get_tensor(f"{prefix}.ffn_up.weight")
+        dff = cfg["d_ff"]
+        return fused[:dff], fused[dff:]
+
+    def has_biases(self, prefix):
+        """Check if this block has QKV biases."""
+        return (f"{prefix}.attn_q.bias" in self.tensors or
+                f"{prefix}.attn_qkv.bias" in self.tensors)
 
     def extract_tokenizer(self):
         """Extract BPE vocab + merges from GGUF metadata."""
@@ -931,11 +990,13 @@ def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_s
                 requires_grad=False)
 
         def forward(self, x):
-            # Upcast to float32 for numerical stability in norm computation
-            xf = x.float()
-            variance = xf.pow(2).mean(dim=1, keepdim=True)
-            x_normed = xf * torch.rsqrt(variance + self.eps)
-            return (x_normed * self.weight.float()).half()
+            # Safe-norm peephole (Dragon Book §8.7): pre-divide by √d
+            # to keep squared values in fp16-safe range on ANE.
+            K = x.shape[1] ** 0.5
+            x_scaled = x * (1.0 / K)
+            variance = x_scaled.pow(2).mean(dim=1, keepdim=True)
+            x_normed = x_scaled * torch.rsqrt(variance + self.eps / (K * K))
+            return (x_normed * self.weight).half()
 
     class QwenLayerConv(nn.Module):
         """Transformer layer — all Conv2d(1×1), fp16.
@@ -962,21 +1023,19 @@ def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_s
             self.attn_norm = RMSNormConv(
                 gguf_model.get_tensor(f"{prefix}.attn_norm.weight"), eps)
 
-            # Fused QKV
-            q_w = gguf_model.get_tensor(f"{prefix}.attn_q.weight")
-            k_w = gguf_model.get_tensor(f"{prefix}.attn_k.weight")
-            v_w = gguf_model.get_tensor(f"{prefix}.attn_v.weight")
+            # Fused QKV (handles both split Qwen and fused Phi layouts)
+            q_w, k_w, v_w = gguf_model.get_qkv_weights(prefix, cfg)
             qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
-            self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=True)
+            has_bias = gguf_model.has_biases(prefix)
+            self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=has_bias)
             self.qkv_conv.weight = nn.Parameter(
                 torch.tensor(qkv_w, dtype=torch.float16).reshape(qkv_dim, d, 1, 1),
                 requires_grad=False)
-            q_b = gguf_model.get_tensor(f"{prefix}.attn_q.bias")
-            k_b = gguf_model.get_tensor(f"{prefix}.attn_k.bias")
-            v_b = gguf_model.get_tensor(f"{prefix}.attn_v.bias")
-            qkv_b = np.concatenate([q_b, k_b, v_b])
-            self.qkv_conv.bias = nn.Parameter(
-                torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
+            if has_bias:
+                biases = gguf_model.get_qkv_biases(prefix, cfg)
+                qkv_b = np.concatenate([biases[0], biases[1], biases[2]])
+                self.qkv_conv.bias = nn.Parameter(
+                    torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
 
             # Output projection
             o_w = gguf_model.get_tensor(f"{prefix}.attn_output.weight")
@@ -985,12 +1044,11 @@ def build_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, group_s
                 torch.tensor(o_w, dtype=torch.float16).reshape(d, d, 1, 1),
                 requires_grad=False)
 
-            # FFN
+            # FFN (handles both split Qwen and fused Phi layouts)
             self.ffn_norm = RMSNormConv(
                 gguf_model.get_tensor(f"{prefix}.ffn_norm.weight"), eps)
 
-            gate_w = gguf_model.get_tensor(f"{prefix}.ffn_gate.weight")
-            up_w = gguf_model.get_tensor(f"{prefix}.ffn_up.weight")
+            gate_w, up_w = gguf_model.get_gate_up_weights(prefix, cfg)
             gate_up_w = np.concatenate([gate_w, up_w], axis=0)
             self.gate_up_conv = nn.Conv2d(d, 2 * dff, 1, bias=False)
             self.gate_up_conv.weight = nn.Parameter(
@@ -1319,10 +1377,12 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
                 requires_grad=False)
 
         def forward(self, x):
-            xf = x.float()
-            variance = xf.pow(2).mean(dim=1, keepdim=True)
-            x_normed = xf * torch.rsqrt(variance + self.eps)
-            return (x_normed * self.weight.float()).half()
+            # Safe-norm peephole (Dragon Book §8.7)
+            K = x.shape[1] ** 0.5
+            x_scaled = x * (1.0 / K)
+            variance = x_scaled.pow(2).mean(dim=1, keepdim=True)
+            x_normed = x_scaled * torch.rsqrt(variance + self.eps / (K * K))
+            return (x_normed * self.weight).half()
 
     class FixedLayerConv(nn.Module):
         """Transformer layer — fixed KV shapes, batched GQA, masked attention."""
@@ -1347,21 +1407,19 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
             self.attn_norm = RMSNormConv(
                 gguf_model.get_tensor(f"{prefix}.attn_norm.weight"), eps)
 
-            # Fused QKV
-            q_w = gguf_model.get_tensor(f"{prefix}.attn_q.weight")
-            k_w = gguf_model.get_tensor(f"{prefix}.attn_k.weight")
-            v_w = gguf_model.get_tensor(f"{prefix}.attn_v.weight")
+            # Fused QKV (handles both split Qwen and fused Phi layouts)
+            q_w, k_w, v_w = gguf_model.get_qkv_weights(prefix, cfg)
             qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
-            self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=True)
+            has_bias = gguf_model.has_biases(prefix)
+            self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=has_bias)
             self.qkv_conv.weight = nn.Parameter(
                 torch.tensor(qkv_w, dtype=torch.float16).reshape(qkv_dim, d, 1, 1),
                 requires_grad=False)
-            q_b = gguf_model.get_tensor(f"{prefix}.attn_q.bias")
-            k_b = gguf_model.get_tensor(f"{prefix}.attn_k.bias")
-            v_b = gguf_model.get_tensor(f"{prefix}.attn_v.bias")
-            qkv_b = np.concatenate([q_b, k_b, v_b])
-            self.qkv_conv.bias = nn.Parameter(
-                torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
+            if has_bias:
+                biases = gguf_model.get_qkv_biases(prefix, cfg)
+                qkv_b = np.concatenate([biases[0], biases[1], biases[2]])
+                self.qkv_conv.bias = nn.Parameter(
+                    torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
 
             # Output projection
             o_w = gguf_model.get_tensor(f"{prefix}.attn_output.weight")
@@ -1370,12 +1428,11 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
                 torch.tensor(o_w, dtype=torch.float16).reshape(d, d, 1, 1),
                 requires_grad=False)
 
-            # FFN
+            # FFN (handles both split Qwen and fused Phi layouts)
             self.ffn_norm = RMSNormConv(
                 gguf_model.get_tensor(f"{prefix}.ffn_norm.weight"), eps)
 
-            gate_w = gguf_model.get_tensor(f"{prefix}.ffn_gate.weight")
-            up_w = gguf_model.get_tensor(f"{prefix}.ffn_up.weight")
+            gate_w, up_w = gguf_model.get_gate_up_weights(prefix, cfg)
             gate_up_w = np.concatenate([gate_w, up_w], axis=0)
             self.gate_up_conv = nn.Conv2d(d, 2 * dff, 1, bias=False)
             self.gate_up_conv.weight = nn.Parameter(
@@ -1661,7 +1718,9 @@ def build_fixed_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0, g
 
 def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0,
                          group_size=32, strategy="uniform",
-                         layer_start=None, layer_end=None):
+                         layer_start=None, layer_end=None,
+                         output_dir=None, output_name=None,
+                         split_mode="full"):
     """Build a stateful CoreML model with KV cache as MLState.
 
     Key differences from build_fixed_model():
@@ -1676,6 +1735,14 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     - Each shard has its own KV state (locally numbered 0..N-1)
     - Embedding lookup, final norm, and LM head are done on host
     - This follows the proven Gemma multi-shard pattern
+
+    split_mode (for large-layer models like Phi-4 14B):
+    - 'full' (default): complete transformer layer per shard
+    - 'attn': attention-only (QKV + O + RoPE + GQA), with KV state
+    - 'ffn': FFN-only (gate_up + down + SiLU), no state
+    When split_mode is 'attn' or 'ffn', each physical layer produces two
+    separate shards. This keeps per-shard compiled size under ~250 MB for
+    models where a full layer exceeds the ANE budget.
 
     NOTE: seq_len must be ≥ 1637 to avoid a CoreML CPU-backend state bug
     that produces NaN at forward pass 3. The threshold depends on model
@@ -1748,14 +1815,22 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
                 requires_grad=False)
 
         def forward(self, x):
-            xf = x.float()
-            variance = xf.pow(2).mean(dim=1, keepdim=True)
-            x_normed = xf * torch.rsqrt(variance + self.eps)
-            return (x_normed * self.weight.float()).to(x.dtype)
+            # Safe-norm peephole (Dragon Book §8.7)
+            K = x.shape[1] ** 0.5
+            x_scaled = x * (1.0 / K)
+            variance = x_scaled.pow(2).mean(dim=1, keepdim=True)
+            x_normed = x_scaled * torch.rsqrt(variance + self.eps / (K * K))
+            return (x_normed * self.weight).to(x.dtype)
 
     class StatefulLayerConv(nn.Module):
-        """Transformer layer — in-place KV state update, batched GQA."""
-        def __init__(self, layer_idx, gguf_model, cfg):
+        """Transformer layer — in-place KV state update, batched GQA.
+
+        split_mode controls which ops to build/run:
+          'full' (default): complete layer (attn + FFN)
+          'attn': attention-only (norm → QKV → RoPE → GQA → O → residual), has KV state
+          'ffn':  FFN-only (norm → gate_up → SiLU → down → residual), no state
+        """
+        def __init__(self, layer_idx, gguf_model, cfg, split_mode="full"):
             super().__init__()
             d = cfg["d_model"]
             dff = cfg["d_ff"]
@@ -1772,57 +1847,53 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             self.dh = cfg["d_head"]
             self.hpk = self.nh // self.nkv
             self.scale = 1.0 / (cfg["d_head"] ** 0.5)
+            self.split_mode = split_mode
 
-            self.attn_norm = RMSNormConv(
-                gguf_model.get_tensor(f"{prefix}.attn_norm.weight"), eps)
+            if split_mode in ("full", "attn"):
+                self.attn_norm = RMSNormConv(
+                    gguf_model.get_tensor(f"{prefix}.attn_norm.weight"), eps)
 
-            # Fused QKV
-            q_w = gguf_model.get_tensor(f"{prefix}.attn_q.weight")
-            k_w = gguf_model.get_tensor(f"{prefix}.attn_k.weight")
-            v_w = gguf_model.get_tensor(f"{prefix}.attn_v.weight")
-            qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
-            self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=True)
-            self.qkv_conv.weight = nn.Parameter(
-                torch.tensor(qkv_w, dtype=torch.float16).reshape(qkv_dim, d, 1, 1),
-                requires_grad=False)
-            q_b = gguf_model.get_tensor(f"{prefix}.attn_q.bias")
-            k_b = gguf_model.get_tensor(f"{prefix}.attn_k.bias")
-            v_b = gguf_model.get_tensor(f"{prefix}.attn_v.bias")
-            qkv_b = np.concatenate([q_b, k_b, v_b])
-            self.qkv_conv.bias = nn.Parameter(
-                torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
+                # Fused QKV (handles both split Qwen and fused Phi layouts)
+                q_w, k_w, v_w = gguf_model.get_qkv_weights(prefix, cfg)
+                qkv_w = np.concatenate([q_w, k_w, v_w], axis=0)
+                has_bias = gguf_model.has_biases(prefix)
+                self.qkv_conv = nn.Conv2d(d, qkv_dim, 1, bias=has_bias)
+                self.qkv_conv.weight = nn.Parameter(
+                    torch.tensor(qkv_w, dtype=torch.float16).reshape(qkv_dim, d, 1, 1),
+                    requires_grad=False)
+                if has_bias:
+                    biases = gguf_model.get_qkv_biases(prefix, cfg)
+                    qkv_b = np.concatenate([biases[0], biases[1], biases[2]])
+                    self.qkv_conv.bias = nn.Parameter(
+                        torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
 
-            # Output projection
-            o_w = gguf_model.get_tensor(f"{prefix}.attn_output.weight")
-            self.out_conv = nn.Conv2d(d, d, 1, bias=False)
-            self.out_conv.weight = nn.Parameter(
-                torch.tensor(o_w, dtype=torch.float16).reshape(d, d, 1, 1),
-                requires_grad=False)
+                # Output projection
+                o_w = gguf_model.get_tensor(f"{prefix}.attn_output.weight")
+                self.out_conv = nn.Conv2d(d, d, 1, bias=False)
+                self.out_conv.weight = nn.Parameter(
+                    torch.tensor(o_w, dtype=torch.float16).reshape(d, d, 1, 1),
+                    requires_grad=False)
 
-            # FFN
-            self.ffn_norm = RMSNormConv(
-                gguf_model.get_tensor(f"{prefix}.ffn_norm.weight"), eps)
+            if split_mode in ("full", "ffn"):
+                # FFN (handles both split Qwen and fused Phi layouts)
+                self.ffn_norm = RMSNormConv(
+                    gguf_model.get_tensor(f"{prefix}.ffn_norm.weight"), eps)
 
-            gate_w = gguf_model.get_tensor(f"{prefix}.ffn_gate.weight")
-            up_w = gguf_model.get_tensor(f"{prefix}.ffn_up.weight")
-            gate_up_w = np.concatenate([gate_w, up_w], axis=0)
-            self.gate_up_conv = nn.Conv2d(d, 2 * dff, 1, bias=False)
-            self.gate_up_conv.weight = nn.Parameter(
-                torch.tensor(gate_up_w, dtype=torch.float16).reshape(2 * dff, d, 1, 1),
-                requires_grad=False)
+                gate_w, up_w = gguf_model.get_gate_up_weights(prefix, cfg)
+                gate_up_w = np.concatenate([gate_w, up_w], axis=0)
+                self.gate_up_conv = nn.Conv2d(d, 2 * dff, 1, bias=False)
+                self.gate_up_conv.weight = nn.Parameter(
+                    torch.tensor(gate_up_w, dtype=torch.float16).reshape(2 * dff, d, 1, 1),
+                    requires_grad=False)
 
-            down_w = gguf_model.get_tensor(f"{prefix}.ffn_down.weight")
-            self.down_conv = nn.Conv2d(dff, d, 1, bias=False)
-            self.down_conv.weight = nn.Parameter(
-                torch.tensor(down_w, dtype=torch.float16).reshape(d, dff, 1, 1),
-                requires_grad=False)
+                down_w = gguf_model.get_tensor(f"{prefix}.ffn_down.weight")
+                self.down_conv = nn.Conv2d(dff, d, 1, bias=False)
+                self.down_conv.weight = nn.Parameter(
+                    torch.tensor(down_w, dtype=torch.float16).reshape(d, dff, 1, 1),
+                    requires_grad=False)
 
-        def forward(self, x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
-                    attn_mask, kv_write_mask):
-            """
-            k_cache/v_cache are registered buffers (state) — updated IN-PLACE.
-            Returns only x (no KV outputs needed).
-            """
+        def _forward_attn(self, x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
+                          attn_mask, kv_write_mask):
             residual = x
             normed = self.attn_norm(x)
 
@@ -1848,13 +1919,11 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             new_k = k.reshape(1, self.nkv, 1, self.dh)
             new_v = v.reshape(1, self.nkv, 1, self.dh)
 
-            # In-place scatter-write to state buffers
             k_updated = k_cache * (1.0 - kv_write_mask) + new_k * kv_write_mask
             v_updated = v_cache * (1.0 - kv_write_mask) + new_v * kv_write_mask
             k_cache[:] = k_updated
             v_cache[:] = v_updated
 
-            # Batched GQA attention
             q_heads = q.reshape(1, self.nh, self.dh)
             attn_parts = []
             for kv_idx in range(self.nkv):
@@ -1872,17 +1941,29 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             attn_out = torch.cat(attn_parts, dim=1)
             attn_out = attn_out.reshape(1, self.d, 1, 1)
             attn_out = self.out_conv(attn_out)
-            x = residual + attn_out
+            return residual + attn_out
 
-            residual2 = x
-            normed2 = self.ffn_norm(x)
-            gate_up = self.gate_up_conv(normed2)
+        def _forward_ffn(self, x):
+            residual = x
+            normed = self.ffn_norm(x)
+            gate_up = self.gate_up_conv(normed)
             gate = gate_up[:, :self.dff, :, :]
             up = gate_up[:, self.dff:, :, :]
             hidden = F.silu(gate.float()).to(gate.dtype) * up
             ffn_out = self.down_conv(hidden)
-            x = residual2 + ffn_out
-            return x
+            return residual + ffn_out
+
+        def forward(self, x, k_cache=None, v_cache=None, rope_cos_pos=None,
+                    rope_sin_pos=None, attn_mask=None, kv_write_mask=None):
+            if self.split_mode == "attn":
+                return self._forward_attn(x, k_cache, v_cache, rope_cos_pos,
+                                          rope_sin_pos, attn_mask, kv_write_mask)
+            elif self.split_mode == "ffn":
+                return self._forward_ffn(x)
+            else:  # full
+                x = self._forward_attn(x, k_cache, v_cache, rope_cos_pos,
+                                       rope_sin_pos, attn_mask, kv_write_mask)
+                return self._forward_ffn(x)
 
     class QwenStatefulConv(nn.Module):
         """Full Qwen — stateful KV cache (register_buffer), batched GQA.
@@ -1892,7 +1973,8 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         output norm are omitted — host does final projection.
         """
         def __init__(self, gguf_model, cfg, n_layers, max_seq_len,
-                     layer_start=0, layer_end=None, is_shard=False):
+                     layer_start=0, layer_end=None, is_shard=False,
+                     split_mode="full"):
             super().__init__()
             if layer_end is None:
                 layer_end = n_layers
@@ -1902,23 +1984,27 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             self.dh = cfg["d_head"]
             self.max_seq_len = max_seq_len
             self.is_shard = is_shard
+            self.split_mode = split_mode
 
+            mode_tag = f" [{split_mode}]" if split_mode != "full" else ""
             self.layers = nn.ModuleList()
             for i in range(layer_start, layer_end):
                 local = i - layer_start
-                print(f"  Layer {i} (local {local}/{self.shard_n})")
-                self.layers.append(StatefulLayerConv(i, gguf_model, cfg))
+                print(f"  Layer {i} (local {local}/{self.shard_n}){mode_tag}")
+                self.layers.append(StatefulLayerConv(i, gguf_model, cfg,
+                                                     split_mode=split_mode))
 
-            # Register KV caches as state buffers (locally numbered 0..shard_n-1)
-            for i in range(self.shard_n):
-                self.register_buffer(f"k_cache_{i}",
-                    torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
-                                dtype=torch.float16))
-                self.register_buffer(f"v_cache_{i}",
-                    torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
-                                dtype=torch.float16))
+            # KV caches only needed for full and attn modes
+            if split_mode in ("full", "attn"):
+                for i in range(self.shard_n):
+                    self.register_buffer(f"k_cache_{i}",
+                        torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
+                                    dtype=torch.float16))
+                    self.register_buffer(f"v_cache_{i}",
+                        torch.zeros(1, cfg["n_kv_heads"], max_seq_len, cfg["d_head"],
+                                    dtype=torch.float16))
 
-            if not is_shard:
+            if not is_shard and split_mode == "full":
                 # Full model: include output norm + LM head
                 out_norm_w = gguf_model.get_tensor("output_norm.weight")
                 self.output_norm = RMSNormConv(out_norm_w, cfg["rms_norm_eps"])
@@ -1934,19 +2020,25 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
                         cfg["vocab_size"], cfg["d_model"], 1, 1),
                     requires_grad=False)
 
-        def forward(self, x, rope_cos_pos, rope_sin_pos, attn_mask, kv_write_mask):
+        def forward(self, x, rope_cos_pos=None, rope_sin_pos=None,
+                    attn_mask=None, kv_write_mask=None):
             """
-            No KV inputs/outputs — state is read/written internally.
-            Returns: logits (full model) or hidden (shard).
+            split_mode='full'/'attn': needs all args, has KV state.
+            split_mode='ffn': only needs x.
+            Returns: logits (full model) or hidden (shard/split).
             """
+            if self.split_mode == "ffn":
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
             for i, layer in enumerate(self.layers):
                 k_cache = getattr(self, f"k_cache_{i}")
                 v_cache = getattr(self, f"v_cache_{i}")
                 x = layer(x, k_cache, v_cache, rope_cos_pos, rope_sin_pos,
                           attn_mask, kv_write_mask)
 
-            if self.is_shard:
-                # Shard: output hidden state for next shard
+            if self.is_shard or self.split_mode == "attn":
                 return x
 
             x = self.output_norm(x)
@@ -1956,10 +2048,11 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
     # ── Build ────────────────────────────────────────────────────────────
 
     build_tag = f" shard [{layer_start},{layer_end})" if is_shard else ""
-    print(f"\nBuilding QwenStatefulConv ({shard_n}L, fp16, stateful KV{build_tag})...")
+    split_tag = f" [{split_mode}]" if split_mode != "full" else ""
+    print(f"\nBuilding QwenStatefulConv ({shard_n}L, fp16, stateful KV{build_tag}{split_tag})...")
     model = QwenStatefulConv(gguf, cfg, n_layers, max_seq_len,
                              layer_start=layer_start, layer_end=layer_end,
-                             is_shard=is_shard)
+                             is_shard=is_shard, split_mode=split_mode)
     model.half()
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
@@ -1989,68 +2082,90 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
 
     d_half = dh // 2
     x_ex = torch.randn(1, d, 1, 1, dtype=torch.float16)
-    cos_ex = torch.randn(1, d_half, dtype=torch.float16)
-    sin_ex = torch.randn(1, d_half, dtype=torch.float16)
-    mask_ex = torch.full((1, 1, 1, max_seq_len), -1e4, dtype=torch.float16)
-    mask_ex[0, 0, 0, 0] = 0.0
-    wmask_ex = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float16)
-    wmask_ex[0, 0, 0, 0] = 1.0
 
-    print("\nTracing (stateful KV)...")
-    with torch.no_grad():
-        output = model(x_ex, cos_ex, sin_ex, mask_ex, wmask_ex)
-        if is_shard:
+    if split_mode == "ffn":
+        # FFN-only: just x in → x out, no rope/mask/state
+        print("\nTracing (FFN-only, no state)...")
+        with torch.no_grad():
+            output = model(x_ex)
             print(f"  hidden: {output.shape}, dtype: {output.dtype}")
-        else:
-            print(f"  logits: {output.shape}, dtype: {output.dtype}")
+        traced = torch.jit.trace(model, (x_ex,))
+    else:
+        # Full or attn: needs rope, mask, has KV state
+        cos_ex = torch.randn(1, d_half, dtype=torch.float16)
+        sin_ex = torch.randn(1, d_half, dtype=torch.float16)
+        mask_ex = torch.full((1, 1, 1, max_seq_len), -1e4, dtype=torch.float16)
+        mask_ex[0, 0, 0, 0] = 0.0
+        wmask_ex = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float16)
+        wmask_ex[0, 0, 0, 0] = 1.0
 
-    traced = torch.jit.trace(model, (x_ex, cos_ex, sin_ex, mask_ex, wmask_ex))
+        mode_label = "attn-only" if split_mode == "attn" else "stateful KV"
+        print(f"\nTracing ({mode_label})...")
+        with torch.no_grad():
+            output = model(x_ex, cos_ex, sin_ex, mask_ex, wmask_ex)
+            if is_shard or split_mode == "attn":
+                print(f"  hidden: {output.shape}, dtype: {output.dtype}")
+            else:
+                print(f"  logits: {output.shape}, dtype: {output.dtype}")
 
-    # Reset KV cache buffers after tracing — forward pass writes NaN/stale values
-    # into caches (fp16 overflow at dh=128), and NaN != NaN breaks coremltools'
-    # torch.equal() assertion in _lower_graph_block.
-    with torch.no_grad():
-        for i in range(shard_n):
-            getattr(model, f"k_cache_{i}").zero_()
-            getattr(model, f"v_cache_{i}").zero_()
+        traced = torch.jit.trace(model, (x_ex, cos_ex, sin_ex, mask_ex, wmask_ex))
+
+        # Reset KV cache buffers after tracing — forward pass writes NaN/stale values
+        # into caches (fp16 overflow at dh=128), and NaN != NaN breaks coremltools'
+        # torch.equal() assertion in _lower_graph_block.
+        with torch.no_grad():
+            for i in range(shard_n):
+                getattr(model, f"k_cache_{i}").zero_()
+                getattr(model, f"v_cache_{i}").zero_()
 
     # ── Convert to CoreML ────────────────────────────────────────────────
 
     conv_tag = f" shard [{layer_start},{layer_end})" if is_shard else ""
-    print(f"\nConverting to CoreML (fp16, {shard_n}L, STATEFUL KV{conv_tag})...")
+    print(f"\nConverting to CoreML (fp16, {shard_n}L{conv_tag}{split_tag})...")
 
-    ct_inputs = [
-        ct.TensorType(name="x", shape=(1, d, 1, 1), dtype=np.float16),
-        ct.TensorType(name="rope_cos", shape=(1, d_half), dtype=np.float16),
-        ct.TensorType(name="rope_sin", shape=(1, d_half), dtype=np.float16),
-        ct.TensorType(name="attn_mask", shape=(1, 1, 1, max_seq_len), dtype=np.float16),
-        ct.TensorType(name="kv_write_mask", shape=(1, 1, max_seq_len, 1), dtype=np.float16),
-    ]
-
-    if is_shard:
+    if split_mode == "ffn":
+        # FFN-only: simple x → hidden, no state
+        ct_inputs = [
+            ct.TensorType(name="x", shape=(1, d, 1, 1), dtype=np.float16),
+        ]
         ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
+        ct_states = []
     else:
-        ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
+        # Full or attn: rope + mask inputs, KV state
+        ct_inputs = [
+            ct.TensorType(name="x", shape=(1, d, 1, 1), dtype=np.float16),
+            ct.TensorType(name="rope_cos", shape=(1, d_half), dtype=np.float16),
+            ct.TensorType(name="rope_sin", shape=(1, d_half), dtype=np.float16),
+            ct.TensorType(name="attn_mask", shape=(1, 1, 1, max_seq_len), dtype=np.float16),
+            ct.TensorType(name="kv_write_mask", shape=(1, 1, max_seq_len, 1), dtype=np.float16),
+        ]
 
-    # KV caches as state — these stay on-device between calls
-    ct_states = []
-    for i in range(shard_n):
-        ct_states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, nkv, max_seq_len, dh), dtype=np.float16),
-            name=f"k_cache_{i}"))
-        ct_states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, nkv, max_seq_len, dh), dtype=np.float16),
-            name=f"v_cache_{i}"))
+        if is_shard or split_mode == "attn":
+            ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
+        else:
+            ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
 
-    mlmodel = ct.convert(
-        traced,
+        # KV caches as state — these stay on-device between calls
+        ct_states = []
+        for i in range(shard_n):
+            ct_states.append(ct.StateType(
+                wrapped_type=ct.TensorType(shape=(1, nkv, max_seq_len, dh), dtype=np.float16),
+                name=f"k_cache_{i}"))
+            ct_states.append(ct.StateType(
+                wrapped_type=ct.TensorType(shape=(1, nkv, max_seq_len, dh), dtype=np.float16),
+                name=f"v_cache_{i}"))
+
+    convert_kwargs = dict(
         inputs=ct_inputs,
         outputs=ct_outputs,
-        states=ct_states,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
         compute_precision=ct.precision.FLOAT16,
     )
+    if ct_states:
+        convert_kwargs["states"] = ct_states
+
+    mlmodel = ct.convert(traced, **convert_kwargs)
 
     # ── Post-training weight quantization ────────────────────────────────
     # For gptq/gptq-real/smooth: PyTorch-level optimization already done; apply
@@ -2074,10 +2189,17 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         suffix = f"_q{quant_bits}{strat_tag}" + (f"g{group_size}" if group_size != 32 else "")
     else:
         suffix = ""
-    if is_shard:
-        prefix = f"QwenANE_{n_layers}L_s{layer_start}-{layer_end}{suffix}"
+    split_suffix = f"_{split_mode}" if split_mode != "full" else ""
+    if output_name:
+        prefix = output_name
+    elif is_shard or split_mode != "full":
+        prefix = f"QwenANE_{n_layers}L_s{layer_start}-{layer_end}{split_suffix}{suffix}"
     else:
         prefix = f"QwenANE_{n_layers}L_stateful{suffix}"
+    if output_dir:
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        prefix = os.path.join(output_dir, prefix)
     pkg_path = f"{prefix}.mlpackage"
     mlmodel.save(pkg_path)
     print(f"\n✓ Saved {pkg_path}")
@@ -2094,11 +2216,12 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         "dtype": "float16",
         "fixed_shapes": True,
         "batched_gqa": True,
-        "stateful_kv": True,
-        "is_shard": is_shard,
+        "stateful_kv": split_mode != "ffn",
+        "split_mode": split_mode,
+        "is_shard": is_shard or split_mode != "full",
         "quant_bits": quant_bits,
     }
-    if not is_shard:
+    if not is_shard and split_mode == "full":
         # Full model: include RoPE tables in per-model meta (legacy compat)
         meta["rope_cos"] = rope_cos.tolist()
         meta["rope_sin"] = rope_sin.tolist()
@@ -2107,10 +2230,10 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
         json.dump(meta, f)
     print(f"  Meta: {meta_path}")
 
-    # ── Shared artifacts (only for full model, not shards) ───────────────
-    # When sharding, the orchestrator exports these once for all shards.
+    # ── Shared artifacts (only for full model, not shards/splits) ──────
+    # When sharding or splitting, the orchestrator exports these once.
 
-    if not is_shard:
+    if not is_shard and split_mode == "full":
         # ── Embeddings ──
         embd_path = f"{prefix}_embd.bin"
         token_embd.astype(np.float16).tofile(embd_path)
@@ -2124,15 +2247,19 @@ def build_stateful_model(gguf_path, n_layers=None, max_seq_len=512, quant_bits=0
             json.dump(tok_data, f)
         print(f"  Tokenizer: {tok_path}")
 
-    output_kind = "hidden (shard)" if is_shard else "logits"
+    is_split_or_shard = is_shard or split_mode != "full"
+    output_kind = "hidden (shard)" if is_split_or_shard else "logits"
+    kv_label = "NONE" if split_mode == "ffn" else "STATEFUL (on-device, zero host copy)"
     print(f"\n{'='*60}")
     print(f"  Model:      Qwen2.5 ({shard_n}L [{layer_start},{layer_end}), d={d}, nh={nh}, nkv={nkv})")
+    print(f"  Split:      {split_mode}")
     print(f"  Format:     CoreML mlprogram (iOS18+)")
-    print(f"  KV Cache:   STATEFUL (on-device, zero host copy)")
-    print(f"  Attention:  Batched GQA ({shard_n * nkv * 2} matmul ops)")
+    print(f"  KV Cache:   {kv_label}")
+    if split_mode != "ffn":
+        print(f"  Attention:  Batched GQA ({shard_n * nkv * 2} matmul ops)")
     print(f"  Output:     {output_kind}")
     print(f"  Dtype:      Float16{f' + int{quant_bits} weights' if quant_bits else ''}")
-    if not is_shard:
+    if not is_split_or_shard:
         print(f"  Tokenizer:  BPE ({len(tok_data['tokens'])} vocab)")
     print(f"  Target:     ANE (CPU_AND_NE, seq_len≥1637 state-bug guard)")
     print(f"{'='*60}")
@@ -2172,13 +2299,42 @@ def main():
                         help="First layer index for shard (inclusive). Requires --stateful.")
     parser.add_argument("--layer-end", type=int, default=None, dest="layer_end",
                         help="Last layer index for shard (exclusive). Requires --stateful.")
+    parser.add_argument("--split-layer", action="store_true", dest="split_layer",
+                        help="Split each layer into attn + FFN sub-shards. Requires --stateful. "
+                             "Produces two .mlpackage per layer range: *_attn.mlpackage (with KV "
+                             "state) and *_ffn.mlpackage (stateless). Use for large-layer models "
+                             "(e.g. Phi-4 14B) where a full layer exceeds the ~250 MB ANE shard limit.")
+    parser.add_argument("--output-dir", default=None, dest="output_dir",
+                        help="Output directory (default: current directory)")
+    parser.add_argument("--output-name", default=None, dest="output_name",
+                        help="Output prefix name (default: auto-generated)")
     args = parser.parse_args()
 
     if args.stateful:
-        build_stateful_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
-                             quant_bits=args.quant_bits, group_size=args.group_size,
-                             strategy=args.quant_strategy,
-                             layer_start=args.layer_start, layer_end=args.layer_end)
+        if args.split_layer:
+            # Split mode: build attn and FFN sub-shards separately
+            common = dict(
+                n_layers=args.layers, max_seq_len=args.seq_len,
+                quant_bits=args.quant_bits, group_size=args.group_size,
+                strategy=args.quant_strategy,
+                layer_start=args.layer_start, layer_end=args.layer_end,
+                output_dir=args.output_dir,
+            )
+            attn_name = f"{args.output_name}_attn" if args.output_name else None
+            ffn_name = f"{args.output_name}_ffn" if args.output_name else None
+            print("═" * 60)
+            print("  SPLIT-LAYER MODE: building attn + FFN sub-shards")
+            print("═" * 60)
+            build_stateful_model(args.gguf, **common, output_name=attn_name,
+                                 split_mode="attn")
+            build_stateful_model(args.gguf, **common, output_name=ffn_name,
+                                 split_mode="ffn")
+        else:
+            build_stateful_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
+                                 quant_bits=args.quant_bits, group_size=args.group_size,
+                                 strategy=args.quant_strategy,
+                                 layer_start=args.layer_start, layer_end=args.layer_end,
+                                 output_dir=args.output_dir, output_name=args.output_name)
     elif args.fixed:
         build_fixed_model(args.gguf, n_layers=args.layers, max_seq_len=args.seq_len,
                           quant_bits=args.quant_bits, group_size=args.group_size,
