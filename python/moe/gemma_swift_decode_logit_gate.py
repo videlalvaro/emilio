@@ -62,8 +62,11 @@ def _print_row_diagnostic(
     step: int,
     swift_row: np.ndarray,
     hf_row: np.ndarray,
-    swift_generated_id: int,
-    hf_generated_id: int,
+    swift_emitted_id: int,
+    hf_emitted_id: int,
+    swift_next_emitted_id: int | None,
+    hf_next_emitted_id: int | None,
+    same_prefix: bool,
 ) -> None:
     swift_top5 = _topk(swift_row)
     hf_top5 = _topk(hf_row)
@@ -74,10 +77,18 @@ def _print_row_diagnostic(
     hf_rank_of_swift_top1 = int(np.sum(hf_row > hf_row[swift_top1])) + 1
     swift_rank_of_hf_top1 = int(np.sum(swift_row > swift_row[hf_top1])) + 1
 
-    print(f"  diag step={step}  cos={_cos(swift_row, hf_row):.4f}")
     print(
-        f"    generated ids: swift={swift_generated_id} hf={hf_generated_id}"
+        f"  diag row={step}  cos={_cos(swift_row, hf_row):.4f}  "
+        f"same_prefix={same_prefix}"
     )
+    print(
+        f"    emitted/input ids for this row: swift={swift_emitted_id} hf={hf_emitted_id}"
+    )
+    if swift_next_emitted_id is not None or hf_next_emitted_id is not None:
+        print(
+            "    next emitted ids from previous row top-1: "
+            f"swift={swift_next_emitted_id} hf={hf_next_emitted_id}"
+        )
     print(f"    swift_top5={swift_top5}")
     print(f"    hf_top5={hf_top5}")
     print(f"    swift_margin={swift_margin:.6f}  hf_margin={hf_margin:.6f}")
@@ -169,12 +180,22 @@ def main() -> int:
         )
 
     hf_logits = golden_next_logits[:rows]
+    same_prefix_rows = first_generated_mismatch if first_generated_mismatch is not None else rows
 
     print(f"  prompt ids: {prompt_ids}")
     if "prompt_text" in meta:
         print(f"  prompt text: {meta['prompt_text']!r}")
-    print(f"  generated ids: {generated_ids}")
+    print(f"  emitted/input ids: {generated_ids}")
     print(f"  logits shape: {swift_logits.shape}")
+    print(
+        "  row semantics: post_token "
+        "(row k is after feeding emitted/input token k, and predicts token k+1)"
+    )
+    if first_generated_mismatch is not None:
+        print(
+            f"  comparable same-prefix rows: 0..{same_prefix_rows - 1} "
+            f"({same_prefix_rows}/{rows})"
+        )
 
     cos_per_step: list[float] = []
     swift_top1: list[int] = []
@@ -187,20 +208,29 @@ def main() -> int:
         cos_per_step.append(cosine)
         swift_top1.append(swift_argmax)
         hf_top1.append(hf_argmax)
-        print(f"  step={step}  cos={cosine:.4f}  swift_top1={swift_argmax}  hf_top1={hf_argmax}")
+        prefix_tag = "same-prefix" if step < same_prefix_rows else "diverged-prefix"
+        print(
+            f"  row={step}  {prefix_tag}  cos={cosine:.4f}  "
+            f"swift_top1={swift_argmax}  hf_top1={hf_argmax}"
+        )
 
-    min_cos = min(cos_per_step) if cos_per_step else 1.0
-    n_top1_agree = sum(int(a == b) for a, b in zip(swift_top1, hf_top1))
-    print(f"\n  min cos     = {min_cos:.4f}  (floor {PASS_COS})")
-    print(f"  top-1 agree = {n_top1_agree}/{rows}")
+    valid_cos = cos_per_step[:same_prefix_rows]
+    valid_swift_top1 = swift_top1[:same_prefix_rows]
+    valid_hf_top1 = hf_top1[:same_prefix_rows]
+    min_cos = min(valid_cos) if valid_cos else 0.0
+    n_top1_agree = sum(int(a == b) for a, b in zip(valid_swift_top1, valid_hf_top1))
+    print(f"\n  same-prefix rows = {same_prefix_rows}/{rows}")
+    print(f"  min cos          = {min_cos:.4f}  (floor {PASS_COS})")
+    print(f"  top-1 agree      = {n_top1_agree}/{same_prefix_rows}")
 
     diagnostic_steps: list[int] = []
     if first_generated_mismatch is not None:
-        print(f"  first generated-id mismatch at index {first_generated_mismatch}")
+        print(f"  first emitted/input-id mismatch at index {first_generated_mismatch}")
         if row_semantics == "post_token" and first_generated_mismatch > 0:
             print(
-                "  post_token note: the likely causal logits row is the previous step; "
-                "the mismatch index itself is already downstream of the wrong token."
+                "  post_token note: the causal logits row for that token choice is "
+                "the previous row; the mismatch row itself is already after feeding "
+                "different tokens."
             )
             diagnostic_steps.extend(
                 [first_generated_mismatch - 1, first_generated_mismatch]
@@ -226,21 +256,27 @@ def main() -> int:
     if diagnostic_steps:
         print("\n  diagnostics:")
         for step in diagnostic_steps:
+            swift_next_emitted = generated_ids[step + 1] if step + 1 < len(generated_ids) else None
+            hf_next_emitted = int(golden_next_ids[step + 1]) if step + 1 < len(golden_next_ids) else None
             _print_row_diagnostic(
                 step,
                 swift_logits[step],
                 hf_logits[step],
                 generated_ids[step],
                 golden_ids_prefix[step],
+                swift_next_emitted,
+                hf_next_emitted,
+                step < same_prefix_rows,
             )
 
-    if generated_ids_mismatch is None and min_cos >= PASS_COS and n_top1_agree == rows:
+    if generated_ids_mismatch is None and min_cos >= PASS_COS and n_top1_agree == same_prefix_rows:
         sentinel.write_text(
             " ".join([
                 f"rows={rows}",
+                f"same_prefix_rows={same_prefix_rows}",
                 f"min_cos={min_cos:.6f}",
                 f"cos_per_step={cos_per_step}",
-                f"top1_agree={n_top1_agree}/{rows}",
+                f"top1_agree={n_top1_agree}/{same_prefix_rows}",
                 f"generated_ids={generated_ids}",
             ]) + "\n"
         )

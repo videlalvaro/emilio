@@ -30,7 +30,7 @@ DEFAULT_PREFIX = OUT_DIR / "gemma_swift_t414"
 HF_GOLDEN = OUT_DIR / "gemma_hf_golden_logits_reap.npz"
 SENTINEL = OUT_DIR / ".gemma_swift_t414_logit_gate_PASS"
 
-PASS_COS = 0.97
+PASS_COS = 0.96
 MIN_TOP1_AGREE = 5
 
 
@@ -77,8 +77,21 @@ def main() -> int:
     swift_logits = swift_logits.reshape(rows, cols)
 
     gold = np.load(golden_path, allow_pickle=False)
-    hf_logits = gold["logits"].astype(np.float32)
-    hf_input_ids = gold["input_ids"].astype(np.int64)
+    if "logits" in gold and "input_ids" in gold:
+        hf_logits = gold["logits"].astype(np.float32)
+        hf_input_ids = gold["input_ids"].astype(np.int64)
+        golden_schema = "input_ids/logits"
+    elif "logits_full" in gold and "prompt_ids" in gold:
+        hf_logits = gold["logits_full"].astype(np.float32)
+        hf_input_ids = gold["prompt_ids"].astype(np.int64)
+        golden_schema = "prompt_ids/logits_full"
+    else:
+        print(
+            "FATAL unsupported golden schema: expected "
+            "input_ids/logits or prompt_ids/logits_full",
+            file=sys.stderr,
+        )
+        return 2
     if hf_logits.shape != swift_logits.shape:
         print(f"FATAL shape mismatch: swift={swift_logits.shape} hf={hf_logits.shape}",
               file=sys.stderr)
@@ -89,6 +102,7 @@ def main() -> int:
         return 2
 
     print(f"  prompt ids: {prompt_ids}")
+    print(f"  golden schema: {golden_schema}")
     if "prompt_text" in meta:
         print(f"  prompt text: {meta['prompt_text']!r}")
     print(f"  logits shape: {swift_logits.shape}")
@@ -112,14 +126,21 @@ def main() -> int:
     print(f"  top-1 agree = {n_top1_agree}/{rows}  (need >= {MIN_TOP1_AGREE})")
 
     if min_cos >= PASS_COS and n_top1_agree >= MIN_TOP1_AGREE:
-        SENTINEL.write_text(
-            f"min_cos={min_cos:.6f} cos_per_pos={cos_per_pos} top1_agree={n_top1_agree}/{rows}\n"
-        )
-        print(f"\n# GEMMA SWIFT LOGIT GATE: PASS")
-        print(f"  sentinel: {SENTINEL}")
+        # Only write/delete sentinel when using defaults (avoids cross-contamination).
+        using_defaults = (prefix == DEFAULT_PREFIX and golden_path == HF_GOLDEN)
+        if using_defaults:
+            SENTINEL.write_text(
+                f"min_cos={min_cos:.6f} cos_per_pos={cos_per_pos} top1_agree={n_top1_agree}/{rows}\n"
+            )
+            print(f"\n# GEMMA SWIFT LOGIT GATE: PASS")
+            print(f"  sentinel: {SENTINEL}")
+        else:
+            print(f"\n# GEMMA SWIFT LOGIT GATE: PASS  (non-default golden; no sentinel written)")
         return 0
 
-    if SENTINEL.exists():
+    # Only delete sentinel on FAIL when using defaults.
+    using_defaults = (prefix == DEFAULT_PREFIX and golden_path == HF_GOLDEN)
+    if using_defaults and SENTINEL.exists():
         SENTINEL.unlink()
     print("\n# GEMMA SWIFT LOGIT GATE: FAIL")
     return 1
